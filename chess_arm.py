@@ -127,7 +127,8 @@ BOARD_BORDER_FRACTION = BOARD_BORDER / BOARD_WIDTH  # 1 cm / 34 cm: the playing 
 VIEW_MARGIN = 0.02  # the yellow markers' outer edges end up this fraction of the image width/height in from its edges
 VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
 #                          climb this much and keep shifting forward
-VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
+VIEW_CENTRE_TOLERANCE = 0.02  # the board counts as centred when it is this fraction of the image from the centre
+VIEW_FIT_TOLERANCE = 0.03  # height counts as right when the markers fill the image to within this fraction
 #  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
 AUTO_CAL_HOVER = 0.10  # check height: the fingertips stop this far above the board over the corner squares
 
@@ -1159,37 +1160,86 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     print(f"  4 corners found: board centre {np.round(centre, 3)}, checker contrast {contrast:.0f}")
     return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
             "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float),
-            "marks": marks, "marks_px": hull_px}
+            "marks": marks, "marks_px": hull_px, "cam_dist": float(plane[0][2])}
 
 
-def view_pose_for(found, intrinsics, R_down):
-    """Gripper (position, yaw) that puts the camera straight above the board centre, turned square
-    to the board, at the height where the 4 yellow markers (whole, not just the board corners)
-    fill the image with VIEW_MARGIN to spare."""
-    fx, fy, cx, cy = intrinsics
-    ex, ey, n, _ = found["axes"]
-    Q = found["outer"]
-    centre = Q.mean(0)
-    R_mount = rot_z(math.radians(CAMERA_MOUNT_YAW_DEG))
-    cam_x0 = (R_down @ R_mount)[:, 0]
-    # smallest turn that lines the image x-axis up with a board edge
+def view_yaw_for(found, R_down) -> float:
+    """Gripper yaw that turns the camera image square to the board (smallest turn)."""
+    ex = found["axes"][0]
+    cam_x0 = (R_down @ rot_z(math.radians(CAMERA_MOUNT_YAW_DEG)))[:, 0]
     turn = math.atan2(ex[1], ex[0]) - math.atan2(cam_x0[1], cam_x0[0])
-    yaw = (turn + math.pi / 4) % (math.pi / 2) - math.pi / 4
-    R_cam = rot_z(yaw) @ R_down @ R_mount
-    # The markers stick out past the board corners. A marker cut off by the image edge looks
-    # smaller, so take the overhang of the one sticking out furthest and apply it to all 4 corners.
-    half_side = max(np.abs((Q - centre) @ ex).max(), np.abs((Q - centre) @ ey).max())
-    d = found["marks"] - centre
-    r = max(half_side, np.maximum(np.abs(d @ ex), np.abs(d @ ey)).max())
-    edge = np.array([centre + r * (sx * ex + sy * ey) for sx in (-1, 1) for sy in (-1, 1)])
-    half_x = np.abs((edge - centre) @ R_cam[:, 0]).max()
-    half_y = np.abs((edge - centre) @ R_cam[:, 1]).max()
-    room_x = min(cx, CAMERA_WIDTH - cx) - VIEW_MARGIN * CAMERA_WIDTH  # pixels from the image centre to the margin
+    return (turn + math.pi / 4) % (math.pi / 2) - math.pi / 4
+
+
+def current_yaw(arm, R_down) -> float:
+    M = arm.pose[:3, :3] @ R_down.T  # = rot_z(yaw)
+    return math.atan2(M[1, 0], M[0, 0])
+
+
+def try_move(arm, cam, robot_white, target, yaw, full_marks=False):
+    """Move, look again; if the corners are lost, try halfway back. Returns found or None (arm back where it was)."""
+    q_before, p_before, yaw_before = arm.q, arm.pose[:3, 3].copy(), current_yaw(arm, arm.R_down)
+    for frac in (1.0, 0.5, 0.25):
+        try:
+            arm.move_to(p_before + frac * (target - p_before), yaw_before + frac * (yaw - yaw_before))
+        except Exception as e:  # noqa: BLE001 - out of reach
+            print(f"  can't move there ({e})")
+            continue
+        if (found := settle_and_locate(arm, cam, robot_white, full_marks=full_marks)) is not None:
+            return found
+        print("  lost the corners there; trying a shorter move")
+    arm.move_joints(q_before)
+    return None
+
+
+def fit_view(arm, cam, R_down, robot_white, found):
+    """Fit the camera to the board in separate, checked steps, steering by what the image shows
+    (so errors in the camera mount or the board's distance only slow it down, never send it off):
+      1. sideways only: centre the board in the image (repeat until centred)
+      2. turn only: square the image to the board, turning about the camera
+      3. up/down only: until the yellow markers just fit, re-centring after each step"""
+    fx, fy, cx, cy = cam.intrinsics
+    room_x = min(cx, CAMERA_WIDTH - cx) - VIEW_MARGIN * CAMERA_WIDTH
     room_y = min(cy, CAMERA_HEIGHT - cy) - VIEW_MARGIN * CAMERA_HEIGHT
-    h = float(max(fx * half_x / room_x, fy * half_y / room_y))  # no fixed height: whatever makes the board fill the image
-    cam_pos = centre + n * h
-    R_ee = rot_z(yaw) @ R_down
-    return cam_pos - R_ee @ mount_offset(), yaw, h
+
+    def centre(found):
+        for _ in range(6):
+            err = found["outer_px"].mean(0) - [cx, cy]  # pixels from the image centre to the board centre
+            if abs(err[0]) < VIEW_CENTRE_TOLERANCE * CAMERA_WIDTH and abs(err[1]) < VIEW_CENTRE_TOLERANCE * CAMERA_HEIGHT:
+                return found
+            Z = found["cam_dist"]
+            R_cam = camera_pose(arm.pose)[:3, :3]
+            step = R_cam @ np.array([err[0] / fx * Z, err[1] / fy * Z, 0.0])
+            step[2] = 0.0  # sideways only
+            print(f"Centring: moving {np.linalg.norm(step) * 100:.1f} cm sideways.")
+            again = try_move(arm, cam, robot_white, arm.pose[:3, 3] + 0.9 * step, current_yaw(arm, R_down))
+            if again is None:
+                return found
+            found = again
+        return found
+
+    found = centre(found)
+
+    yaw = view_yaw_for(found, R_down)
+    if abs(yaw - current_yaw(arm, R_down)) > math.radians(1):
+        print(f"Turning to square the image to the board ({math.degrees(yaw):.0f} deg).")
+        cam_pos = camera_pose(arm.pose)[:3, 3]  # keep the camera where it is, turn about it
+        target = cam_pos - rot_z(yaw) @ R_down @ mount_offset()
+        if (again := try_move(arm, cam, robot_white, target, yaw)) is not None:
+            found = centre(again)
+
+    for _ in range(4):
+        px = found["marks_px"]
+        fill = max(np.abs(px[:, 0] - cx).max() / room_x, np.abs(px[:, 1] - cy).max() / room_y)  # 1 = just fits
+        if abs(fill - 1) < VIEW_FIT_TOLERANCE:
+            break
+        dz = found["cam_dist"] * (fill - 1)  # pixel size goes as 1 / distance
+        print(f"Adjusting height only: {'up' if dz > 0 else 'down'} {abs(dz) * 100:.1f} cm (markers fill {fill:.0%}).")
+        again = try_move(arm, cam, robot_white, arm.pose[:3, 3] + [0, 0, dz], current_yaw(arm, R_down))
+        if again is None:
+            break
+        found = centre(again)
+    return found
 
 
 def near_corners_in_view(arm, fwd) -> bool:
@@ -1253,11 +1303,11 @@ def search_board(arm, cam: RealSenseCamera, robot_white: bool):
     return None
 
 
-def settle_and_locate(arm, cam, robot_white, tries=3):
+def settle_and_locate(arm, cam, robot_white, tries=3, full_marks=True):
     """locate_board, giving the camera a moment to settle (exposure, vibration) after a move."""
     for _ in range(tries):
         time.sleep(0.5)
-        if (found := locate_board(arm, cam, robot_white, full_marks=True)) is not None:
+        if (found := locate_board(arm, cam, robot_white, full_marks=full_marks)) is not None:
             return found
     return None
 
@@ -1283,39 +1333,7 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
                 sys.exit("Auto-calibration failed. Check the board position and CORNER_HSV (see board_detect_debug.png).")
             continue
 
-        # zoom: centred, square to the image, corners at the image edges
-        for _ in range(4):
-            target, yaw, h = view_pose_for(found, cam.intrinsics, cal.R_down)
-            if float(np.linalg.norm(target - arm.pose[:3, 3])) < VIEW_FIT_TOLERANCE:
-                break
-            print(f"Zooming to the board: camera {h:.2f} m above it, turned {math.degrees(yaw):.0f} deg.")
-            q_before = arm.q
-            T_before = arm.pose
-            p_before = T_before[:3, 3].copy()
-            M = T_before[:3, :3] @ cal.R_down.T  # = rot_z(current yaw)
-            yaw_before = math.atan2(M[1, 0], M[0, 0])
-            try:
-                arm.move_to(target, yaw)
-            except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
-                print(f"  can't move there ({e}); keeping the current view")
-                break
-            again = settle_and_locate(arm, cam, robot_white)
-            # lost them (too far, or not a square any more): try partway between the last good view and the target
-            for frac in (0.5, 0.25):
-                if again is not None:
-                    break
-                print(f"  lost the corners there; trying {frac:.0%} of the way")
-                try:
-                    arm.move_to(p_before + frac * (target - p_before), yaw_before + frac * (yaw - yaw_before))
-                except Exception as e:  # noqa: BLE001
-                    print(f"  can't move there ({e})")
-                    continue
-                again = settle_and_locate(arm, cam, robot_white)
-            if again is None:
-                print("  going back to the last good view")
-                arm.move_joints(q_before)
-                break
-            found = again
+        found = fit_view(arm, cam, cal.R_down, robot_white, found)
 
         if (whole := settle_and_locate(arm, cam, robot_white, tries=1)) is not None:
             found = whole

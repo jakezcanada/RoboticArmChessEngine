@@ -57,10 +57,12 @@ where they are in the camera image (`CORNER_LABELS`): bottom-left h8, bottom-rig
 top-left h1, top-right a1. The playing area starts
 `BOARD_BORDER` (1 cm) in from the corners; squares are 4 cm (`SQUARE_SIZE`), so the board is 34 cm.
 
-**The camera then fits itself to the board:** it moves straight above the board's centre,
-turns square to it, and goes to whatever height puts the 4 corners at the edges of the
-image (`VIEW_MARGIN`, 2%, in from them); there is no fixed camera height. It checks again from there and repeats until the view stops
-changing. You confirm the view (or search again); then it is saved as the viewing pose, and
+**The camera then fits itself to the board** in separate steps, each checked with a new
+picture: (1) sideways only, until the board is centred in the image; (2) turn only, about
+the camera, until the image is square to the board; (3) up/down only, until the yellow
+markers just fit (`VIEW_MARGIN`, 2% in from the edges), re-centring after each step. It
+steers by the image, so camera-mount or distance errors only make it take an extra step.
+If a move loses the corners it tries half and a quarter of the way. You confirm the view (or search again); then it is saved as the viewing pose, and
 the arm hovers 10 cm above a1, h1, h8 and a8 (`AUTO_CAL_HOVER`) using the saved positions only.
 At each one you type how far off it is (`forward left [high]` in cm, Enter = on target); the
 average miss is taken off the board position and learned as a camera-mount correction
