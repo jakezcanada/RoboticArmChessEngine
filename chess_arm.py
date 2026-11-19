@@ -11,8 +11,9 @@ One file that runs on the robot PC. It:
   * asks Stockfish for the robot's move
 
 Workflow (run each step once per setup, then play):
-    python chess_arm.py calibrate-board      teach where the board is (hand-guide the arm)
-    python chess_arm.py calibrate-camera     set the viewing pose and click the board corners
+    python chess_arm.py auto-calibrate       find the board with the camera (yellow corners) and check it;
+                                             `play` also finds the board by itself every time it starts
+    (manual alternative: calibrate-board, then calibrate-camera)
     python chess_arm.py view                 live detection overlay, for tuning the variables below
     python chess_arm.py pick-test e2 e4      move one piece, to test grasping
     python chess_arm.py play                 play a game
@@ -23,6 +24,7 @@ Useful options (put them before the command):
     --manual-moves         type the human's moves instead of using the camera
     --dry-run              print arm commands instead of moving (no robot needed)
     --robot-color white    robot plays white (default black)
+    --no-calibrate         reuse the saved board position instead of finding the board again
 
 Every value marked ESTIMATE is a guess. Measure your set and change it.
 """
@@ -46,7 +48,7 @@ import numpy as np
 # CONFIGURATION
 # =============================================================================
 
-ROBOT_IP = "172.16.0.2"  # Panda FCI address (check the lab PC)
+ROBOT_IP = "192.168.1.107"  # Panda FCI address
 CALIBRATION_FILE = Path(__file__).with_name("chess_calibration.json")
 
 # --- Stockfish -------------------------------------------------------------
@@ -63,7 +65,8 @@ VERIFY_ROBOT_MOVES = True  # after the robot moves, check the board with the cam
 # --- Board (ESTIMATE; the real size is measured by calibrate-board) --------
 INCH = 0.0254
 SQUARE_SIZE = 1.5 * INCH  # only used to warn if the calibration looks wrong
-BOARD_BORDER = 2.0 * INCH  # border between the playing area and the board's edge
+BOARD_BORDER = 0.4 * INCH  # ESTIMATE: border between the playing area and the board's edge (only a fallback;
+#                            auto-calibrate measures it)
 
 # --- Pieces (ESTIMATES for a set that fits 1.5" squares, in metres) --------
 P, N, B, R, Q, K = chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
@@ -98,10 +101,30 @@ WARP_PX_PER_SQUARE = 80  # resolution of the top-down board image
 WARP_MARGIN = 0.5  # squares of border kept around the playing area (used to find the board plane)
 CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unavailable
 
+# --- Automatic board calibration (auto-calibrate) --------------------------
+#     The arm looks down, finds the yellow corner brackets, and takes the wood-coloured board
+#     between them. The board must be empty, or set up in the starting position (ranks 4 and 5 empty).
+#     Colours below were measured from a photo of the lab board. Hue ranges may wrap around
+#     180 (e.g. (170, ...) to (12, ...)) because reddish-brown sits at both ends of the hue scale.
+BOARD_GUESS_CENTRE = (0.50, 0.0, 0.0)  # ESTIMATE: rough board centre in the robot base frame (m), where to look first
+CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in the gripper (EE) frame (m). MEASURE IT:
+#                                           an error here moves the whole board by the same amount.
+CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
+CORNER_HSV = ((15, 150, 120), (35, 255, 255))  # yellow corner brackets (measured: H 24-27, S 230-255, V 220-255)
+CORNER_MIN_COUNT = 3  # yellow corners that must be seen (of 4)
+BOARD_DARK_HSV = ((170, 80, 60), (12, 220, 215))  # dark squares and border (measured: H 7-8, S 118-140, V 125-160)
+BOARD_WOOD_MIN_SAT = 35  # any board wood (light squares: S ~60) is more saturated than the grey table (S < 30)
+BOARD_MIN_AREA = 0.05  # the board must fill at least this fraction of the camera image
+#  If the board isn't found, look at board_detect_debug.png: red = board wood, cyan = yellow corners.
+AUTO_CAL_HOVER = 0.010  # check height: the fingertips stop this far above a1, h1 and h8
+
 # --- COLOR detection: these are the variables to tune (HSV, OpenCV ranges H 0-180, S/V 0-255)
 #     Use `python chess_arm.py view` to see the result live.
-WHITE_PIECE_HSV = ((0, 0, 170), (180, 70, 255))  # light pieces: bright, unsaturated
-BLACK_PIECE_HSV = ((0, 0, 0), (180, 255, 80))  # dark pieces: low brightness
+#     Measured from a photo of the lab set: light-wood pieces H 18-20, S 75-110, V 200-240;
+#     dark-wood pieces H 0-11, S 110-230, V 25-120. Light squares are H 13-15, S ~60;
+#     dark squares are brighter than the dark pieces (V 125-160). Hue ranges may wrap around 180.
+WHITE_PIECE_HSV = ((16, 70, 150), (24, 150, 255))  # light-wood pieces
+BLACK_PIECE_HSV = ((170, 70, 10), (12, 255, 120))  # dark-wood pieces
 COLOR_MIN_FRACTION = 0.20  # fraction of a square's sample area that must match a piece color
 SAMPLE_RADIUS = 0.35  # sample disk radius, as a fraction of a square
 USE_BACKGROUND_SUBTRACTION = True  # ignore pixels that look like the empty square (learned at setup)
@@ -337,6 +360,8 @@ class RealSenseCamera:
         profile = self.pipe.start(cfg)
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
         self.align = rs.align(rs.stream.color)  # depth pixels line up with colour pixels
+        i = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.intrinsics = (i.fx, i.fy, i.ppx, i.ppy)
         for _ in range(15):  # let auto-exposure settle
             self.pipe.wait_for_frames()
 
@@ -369,6 +394,14 @@ def square_centre_px(sq: int) -> np.ndarray:
 
 def is_light(sq: int) -> bool:
     return (chess.square_file(sq) + chess.square_rank(sq)) % 2 == 1
+
+
+def hsv_mask(hsv, rng) -> np.ndarray:
+    """Boolean mask of pixels inside an HSV range. If low hue > high hue the range wraps past 180."""
+    (h0, s0, v0), (h1, s1, v1) = rng
+    h, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    hue_ok = (h >= h0) & (h <= h1) if h0 <= h1 else (h >= h0) | (h <= h1)
+    return hue_ok & (sat >= s0) & (sat <= s1) & (val >= v0) & (val <= v1)
 
 
 @dataclass
@@ -441,8 +474,8 @@ class BoardVision:
         """Boolean images: pixels that look like a white piece / a black piece."""
         cv2 = self.cv2
         hsv = cv2.cvtColor(obs.color, cv2.COLOR_BGR2HSV)
-        white = cv2.inRange(hsv, np.array(WHITE_PIECE_HSV[0]), np.array(WHITE_PIECE_HSV[1])) > 0
-        black = cv2.inRange(hsv, np.array(BLACK_PIECE_HSV[0]), np.array(BLACK_PIECE_HSV[1])) > 0
+        white = hsv_mask(hsv, WHITE_PIECE_HSV)
+        black = hsv_mask(hsv, BLACK_PIECE_HSV)
         if USE_BACKGROUND_SUBTRACTION and self.background is not None:
             lab = cv2.cvtColor(obs.color, cv2.COLOR_BGR2LAB).astype(np.float32)
             diff = np.linalg.norm(lab - self._background_image(), axis=2) > BACKGROUND_MIN_DIFF
@@ -844,6 +877,347 @@ class Stockfish:
 
 
 # =============================================================================
+# AUTOMATIC BOARD CALIBRATION
+# =============================================================================
+
+
+def camera_pose(arm_pose: np.ndarray) -> np.ndarray:
+    """Camera pose in the robot base frame, from the gripper pose and the camera mount."""
+    T = np.eye(4)
+    T[:3, :3] = rot_z(math.radians(CAMERA_MOUNT_YAW_DEG))
+    T[:3, 3] = CAMERA_MOUNT_OFFSET
+    return arm_pose @ T
+
+
+def depth_at(depth, u, v, r=3) -> float:
+    win = depth[max(int(v) - r, 0) : int(v) + r + 1, max(int(u) - r, 0) : int(u) + r + 1]
+    win = win[win > 0]
+    return float(np.median(win)) if win.size else float("nan")
+
+
+def pixel_rays(px, intrinsics) -> np.ndarray:
+    fx, fy, cx, cy = intrinsics
+    px = np.asarray(px, float)
+    return np.column_stack([(px[:, 0] - cx) / fx, (px[:, 1] - cy) / fy, np.ones(len(px))])
+
+
+def fit_plane(depth, mask, intrinsics, samples=3000):
+    """Plane (point, normal) in the camera frame through the depth readings under ``mask``.
+    Points well off the plane (dark pieces, noise) are dropped."""
+    v, u = np.nonzero(mask & (depth > 0))
+    if len(u) < 100:
+        return None
+    rng = np.random.default_rng(0)
+    pick = rng.choice(len(u), min(samples, len(u)), replace=False)
+    pts = pixel_rays(np.column_stack([u[pick], v[pick]]), intrinsics) * depth[v[pick], u[pick], None]
+    # RANSAC first: pieces can cover a third of the board, which drags a plain least-squares fit
+    keep, best = None, 0
+    for _ in range(200):
+        a, b, c = pts[rng.choice(len(pts), 3, replace=False)]
+        n = np.cross(b - a, c - a)
+        if np.linalg.norm(n) < 1e-9:
+            continue
+        n /= np.linalg.norm(n)
+        inl = np.abs((pts - a) @ n) < 0.004
+        if inl.sum() > best:
+            keep, best = inl, inl.sum()
+    if keep is None or best < 50:
+        return None
+    for _ in range(3):
+        c = pts[keep].mean(0)
+        n = np.linalg.svd(pts[keep] - c)[2][2]
+        keep = np.abs((pts - c) @ n) < 0.005
+        if keep.sum() < 50:
+            return None
+    return c, n
+
+
+def on_plane(px, plane, intrinsics) -> np.ndarray:
+    """Camera-frame points where the pixels' rays meet the plane."""
+    c, n = plane
+    rays = pixel_rays(px, intrinsics)
+    return rays * ((n @ c) / (rays @ n))[:, None]
+
+
+def project(points_base, cam_T, intrinsics):
+    """Robot-base points -> camera pixels."""
+    fx, fy, cx, cy = intrinsics
+    p = (np.asarray(points_base) - cam_T[:3, 3]) @ cam_T[:3, :3]  # into the camera frame
+    return np.column_stack([fx * p[:, 0] / p[:, 2] + cx, fy * p[:, 1] / p[:, 2] + cy])
+
+
+def dark_mask(color):
+    """Pixels the colour of the border / dark squares."""
+    import cv2
+
+    return hsv_mask(cv2.cvtColor(color, cv2.COLOR_BGR2HSV), BOARD_DARK_HSV)
+
+
+def board_masks(color):
+    """(yellow corner pixels, board wood pixels)."""
+    import cv2
+
+    hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+    k5 = np.ones((5, 5), np.uint8)
+    yellow = cv2.morphologyEx(hsv_mask(hsv, CORNER_HSV).astype(np.uint8), cv2.MORPH_OPEN, k5)
+    near_yellow = cv2.dilate(yellow, k5, iterations=2) > 0
+    hue = hsv[..., 0]
+    wood = (hsv[..., 1] >= BOARD_WOOD_MIN_SAT) & ((hue <= 25) | (hue >= 165)) & ~near_yellow
+    wood = cv2.morphologyEx(wood.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    wood = cv2.morphologyEx(wood, cv2.MORPH_OPEN, k5)
+    return yellow > 0, wood > 0
+
+
+def refine_quad(pts, quad, side):
+    """Sharper corners: fit a line to the outline points along each side, then intersect the lines."""
+    lines = []
+    for i in range(4):
+        p, q = quad[i], quad[(i + 1) % 4]
+        d = (q - p) / np.linalg.norm(q - p)
+        rel = pts - p
+        along = rel @ d
+        off = np.abs(rel @ np.array([-d[1], d[0]]))
+        L = np.linalg.norm(q - p)
+        sel = pts[(off < 0.03 * side) & (along > 0.15 * L) & (along < 0.85 * L)]  # middle of the side only
+        if len(sel) < 10:
+            return quad
+        c = sel.mean(0)
+        direction = np.linalg.svd(sel - c)[2][0]
+        lines.append((c, direction))
+    out = []
+    for i in range(4):  # corner i joins side i-1 and side i
+        (c1, d1), (c2, d2) = lines[i - 1], lines[i]
+        A = np.column_stack([d1, -d2])
+        if abs(np.linalg.det(A)) < 1e-6:
+            return quad
+        t = np.linalg.solve(A, c2 - c1)
+        out.append(c1 + t[0] * d1)
+    out = np.array(out)
+    return out if np.max(np.linalg.norm(out - quad, axis=1)) < 0.05 * side else quad
+
+
+def find_board_outline(yellow, wood):
+    """Outer corners (4 x 2 pixels) of the wood region framed by the yellow corners, or (None, reason)."""
+    import cv2
+
+    img_area = yellow.size
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(yellow.astype(np.uint8))
+    corners = [cents[i] for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 0.0003 * img_area]
+    if len(corners) < CORNER_MIN_COUNT:
+        return None, f"only {len(corners)} yellow corner(s) seen (need {CORNER_MIN_COUNT})"
+    # the board is the big wood region that touches the yellow corners
+    touch = cv2.dilate(yellow.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=4) > 0
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(wood.astype(np.uint8))
+    best, best_touch = 0, 0
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < BOARD_MIN_AREA * img_area:
+            continue
+        t = np.count_nonzero(touch & (labels == i))
+        if t > best_touch:
+            best, best_touch = i, t
+    if not best:
+        return None, "no large wood-coloured area next to the yellow corners"
+    contour = cv2.findContours((labels == best).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0]
+    hull = cv2.convexHull(contour)
+    quad = None
+    for eps in np.linspace(0.01, 0.08, 15):
+        approx = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2).astype(float)
+            break
+    if quad is None:
+        return None, "the board outline isn't four-sided"
+    side = np.mean([np.linalg.norm(quad[(i + 1) % 4] - quad[i]) for i in range(4)])
+    quad = refine_quad(contour.reshape(-1, 2).astype(float), quad, side)
+    at_corner = sum(np.min(np.linalg.norm(quad - c, axis=1)) < 0.15 * side for c in corners)
+    if at_corner < CORNER_MIN_COUNT:
+        return None, f"only {at_corner} yellow corner(s) are at a corner of the wood area"
+    return quad, None
+
+
+def border_fraction(color, H, n_px=800):
+    """Border width as a fraction of the board's outer size.
+
+    The board is warped top-down (a-file left, rank 8 top). Ranks 4 and 5 are empty in the
+    starting position; along them the outermost light squares (a4 on the left, h5 on the
+    right) start exactly where the playing area starts."""
+    import cv2
+
+    top = cv2.warpPerspective(color, H, (n_px, n_px))
+    # light = not dark wood; opening with a wide kernel drops thin lines (inlay, fold seam, table edge)
+    light = cv2.morphologyEx((~dark_mask(top)).astype(np.uint8), cv2.MORPH_OPEN, np.ones((1, n_px // 40), np.uint8)) > 0
+    band = slice(int(n_px * 0.42), int(n_px * 0.58))  # rows across ranks 4 and 5 (border up to ~1.5 squares)
+    lefts, rights = [], []
+    for row in light[band]:
+        cols = np.nonzero(row)[0]
+        if len(cols):
+            lefts.append(cols.min())
+            rights.append(cols.max())
+    if len(lefts) < 10:
+        return None
+    left = np.percentile(lefts, 20) / n_px  # rank-4 rows start with a light square (a4)
+    right = 1 - np.percentile(rights, 80) / n_px  # rank-5 rows end with a light square (h5)
+    if abs(left - right) > 0.03 or not 0 <= left < 0.25:
+        return None
+    return (left + right) / 2
+
+
+def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
+    """Look for the board from where the arm is now. Returns (a1, h1, h8, (ex, ey, n, square)) or None."""
+    import cv2
+
+    color, depth, _ = cam.read()
+    yellow, wood = board_masks(color)
+    quad, why = find_board_outline(yellow, wood)
+    debug = color.copy()
+    debug[wood] = (debug[wood] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+    debug[yellow] = (255, 255, 0)
+    debug_path = Path(__file__).with_name("board_detect_debug.png")
+    if quad is None:
+        cv2.imwrite(str(debug_path), debug)
+        print(f"  board not found: {why} (see {debug_path.name}: red = wood, cyan = yellow)")
+        return None
+    mask = wood
+    h_img, w_img = mask.shape
+    if quad[:, 0].min() < 3 or quad[:, 1].min() < 3 or quad[:, 0].max() > w_img - 4 or quad[:, 1].max() > h_img - 4:
+        cv2.imwrite(str(debug_path), debug)
+        print(f"  the board runs off the edge of the camera image; raise VIEW_HEIGHT or move the camera ({debug_path.name})")
+        return None
+    inside = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(inside, quad.astype(np.int32), 1)
+    plane = fit_plane(depth, mask & (inside > 0), cam.intrinsics)
+    if plane is None:
+        print("  board found, but not enough depth readings on it")
+        return None
+    cam_T = camera_pose(arm.pose)
+    Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # outer corners, base frame
+    centre = Q.mean(0)
+    n = np.cross(Q[1] - Q[0], Q[2] - Q[1])
+    n /= np.linalg.norm(n)
+    if n[2] < 0:
+        n = -n
+    # ranks run towards the robot when it plays black (it sits behind rank 8)
+    towards_robot = np.array([-centre[0], -centre[1], 0.0])
+    want = -towards_robot if robot_white else towards_robot
+    edges = [Q[(i + 1) % 4] - Q[i] for i in range(4)]
+    ey = max((e if e @ want >= 0 else -e for e in edges), key=lambda e: e @ want / np.linalg.norm(e))
+    ey = ey - n * (n @ ey)
+    ey /= np.linalg.norm(ey)
+    ex = np.cross(ey, n)
+    rel = Q - centre
+    order = [np.argmin(rel @ (ex + ey)), np.argmax(rel @ (ex - ey)), np.argmax(rel @ (ex + ey)), np.argmax(rel @ (ey - ex))]
+    if len(set(order)) < 4:
+        print("  board outline isn't a clean square")
+        return None
+    px = quad[order]  # image corners: a1, h1, h8, a8 (outer edge of the border)
+    H = cv2.getPerspectiveTransform(np.float32(px), np.float32([[0, 800], [800, 800], [800, 0], [0, 0]]))
+    b = border_fraction(color, H)
+    if b is None:
+        b = BOARD_BORDER / (8 * SQUARE_SIZE + 2 * BOARD_BORDER)
+        print(f"  couldn't measure the border from the light squares; using BOARD_BORDER ({b:.3f} of the board)")
+    inner_warp = np.float32([[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]) * 800
+    inner_px = cv2.perspectiveTransform(inner_warp[None], np.linalg.inv(H))[0]
+    C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # playing-area corners
+    sq = np.mean([np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]) / 8
+    a1 = C[0] + sq / 2 * (ex + ey)
+    cv2.polylines(debug, [inner_px.astype(np.int32)], True, (0, 255, 0), 2)
+    for name, pt in zip(("a1", "h1", "h8", "a8"), inner_px):
+        cv2.putText(debug, name, tuple(int(x) for x in pt), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.imwrite(str(debug_path), debug)
+    print(f"  board found: square {sq * 1000:.1f} mm, border {b * (8 * sq) / (1 - 2 * b) * 1000:.0f} mm, "
+          f"centre {np.round(centre, 3)}")
+    return a1, a1 + 7 * sq * ex, a1 + 7 * sq * (ex + ey), (ex, ey, n, sq)
+
+
+def teach_points(arm, cal: Calibration, names=("a1", "h1", "h8")):
+    """Hand-guide the closed fingertips onto squares to record their positions."""
+    arm.open(0.0)  # closed fingers = a single point to touch the board with
+    arm.teaching_mode(True)
+    try:
+        for name in names:
+            input(f"Guide the closed fingertips onto the CENTRE of {name}, touching the board, then press Enter.")
+            setattr(cal, name, arm.pose[:3, 3].copy())
+            print(f"  {name} = {np.round(getattr(cal, name), 4)}")
+    finally:
+        arm.teaching_mode(False)
+
+
+def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: bool = True):
+    """Find the board with the camera and fill in a1, h1, h8, R_down, q_view and image_corners.
+
+    ``check``: afterwards hover over a1, h1, h8 and ask whether that looks right."""
+    robot_white = args.robot_color == "white"
+    print("Finding the board (it must be empty or in the starting position).")
+    # look first where the board was last time, else at BOARD_GUESS_CENTRE
+    last = BoardFrame(cal).centre() if cal.a1 is not None else None
+    look_at = last if last is not None else np.array(BOARD_GUESS_CENTRE, float)
+    arm.home()
+    cal.R_down = arm.pose[:3, :3]
+    arm.R_down = cal.R_down
+    found = None
+    for extra in (0.0, 0.15, 0.30):  # go higher if the board doesn't fit in the image
+        print(f"Looking for the board from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
+        arm.move_to(look_at + [0, 0, VIEW_HEIGHT + extra])
+        if (found := locate_board(arm, cam, robot_white)) is not None:
+            break
+    while found is None:
+        if input("Board not found. Hand-guide the camera over the board and try again? [Y/n] ").strip().lower() == "n":
+            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE, CORNER_HSV and BOARD_DARK_HSV "
+                     "(see board_detect_debug.png), or use calibrate-board / calibrate-camera.")
+        arm.teaching_mode(True)
+        input("Move the arm so the camera sees the whole board from above, then press Enter.")
+        arm.teaching_mode(False)
+        found = locate_board(arm, cam, robot_white)
+    view_h = max(VIEW_HEIGHT, float((arm.pose[:3, 3] - found[0]) @ found[3][2]))  # the height that worked
+
+    # second look, straight above the board centre: a better estimate, and the viewing pose
+    cal.a1, cal.h1, cal.h8 = found[:3]
+    arm.move_to(BoardFrame(cal).centre(view_h))
+    print("Looking again from above the board centre.")
+    found = locate_board(arm, cam, robot_white) or found
+    cal.a1, cal.h1, cal.h8 = found[:3]
+    ex, ey, _, s = found[3]
+    board = BoardFrame(cal)
+    arm.move_to(board.centre(view_h))
+    cal.q_view = arm.q
+    a8 = cal.a1 + 7 * s * ey
+    outer = [cal.a1 - s / 2 * (ex + ey), cal.h1 + s / 2 * (ex - ey), cal.h8 + s / 2 * (ex + ey), a8 + s / 2 * (ey - ex)]
+    cal.image_corners = project(outer, camera_pose(arm.pose), cam.intrinsics)
+
+    if check:  # hover just above a1, h1, h8
+        arm.open(0.0)
+        for name in ("a1", "h1", "h8"):
+            p = getattr(cal, name)
+            arm.move_to(p + board.ez * SAFE_HEIGHT)
+            arm.move_to(p + board.ez * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
+            print(f"  the fingertips should be just above the centre of {name}")
+            time.sleep(1.0)
+            arm.move_to(p + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
+        if input("Were the fingertips over the centres of a1, h1 and h8? [Y/n] ").strip().lower() == "n":
+            print("Teach the three squares by hand instead (the camera calibration is kept).")
+            teach_points(arm, cal)
+            board = BoardFrame(cal)
+            arm.move_to(board.centre(SAFE_HEIGHT))
+    print(f"Square size {board.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, board.ez[2]))):.1f} deg.")
+    if last is not None:
+        print(f"The board moved {np.linalg.norm(board.centre() - last) * 1000:.0f} mm since the last calibration.")
+    cal.save()
+    arm.move_joints(cal.q_view)
+
+
+def cmd_auto_calibrate(args):
+    if args.dry_run:
+        sys.exit("auto-calibrate needs the robot and the camera; it can't run with --dry-run.")
+    cal = Calibration.load()
+    arm = make_arm(args, cal)
+    cam = RealSenseCamera()
+    try:
+        auto_calibrate(args, cal, arm, cam)
+    finally:
+        cam.close()
+
+
+# =============================================================================
 # COMMANDS
 # =============================================================================
 
@@ -859,15 +1233,7 @@ def cmd_calibrate_board(args):
     arm.home()
     cal.R_down = arm.pose[:3, :3]
     arm.R_down = cal.R_down
-    arm.open(0.0)  # closed fingers = a single point to touch the board with
-    arm.teaching_mode(True)
-    try:
-        for name in ("a1", "h1", "h8"):
-            input(f"Guide the closed fingertips onto the CENTRE of {name}, touching the board, then press Enter.")
-            setattr(cal, name, arm.pose[:3, 3].copy())
-            print(f"  {name} = {np.round(getattr(cal, name), 4)}")
-    finally:
-        arm.teaching_mode(False)
+    teach_points(arm, cal)
     b = BoardFrame(cal)
     print(f"Square size {b.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, b.ez[2]))):.1f} deg.")
     cal.save()
@@ -960,15 +1326,23 @@ def cmd_view(args):
         cam.close()
 
 
-def build_game_parts(args, need_camera: bool):
+def build_game_parts(args, need_camera: bool, find_board: bool = False):
+    """``find_board``: always locate the board first (play). Otherwise only when there's no calibration."""
     cal = Calibration.load()
-    board_frame = BoardFrame(cal)
     arm = make_arm(args, cal)
     cam = vision = None
+    missing = cal.a1 is None or cal.image_corners is None
+    if not args.dry_run and (missing or (find_board and not args.no_calibrate)):
+        cam = RealSenseCamera()
+        auto_calibrate(args, cal, arm, cam, check=False)
+    board_frame = BoardFrame(cal)
     if need_camera:
         cal.require("q_view", "image_corners")
-        cam = RealSenseCamera()
+        cam = cam or RealSenseCamera()
         vision = BoardVision(cam, cal, args.detect)
+    elif cam:
+        cam.close()
+        cam = None
     R_down = cal.R_down if cal.R_down is not None else arm.R_down
     adjuster = PickAdjuster(vision, board_frame, R_down, args.adjust)
     if args.adjust and vision is None:
@@ -995,7 +1369,7 @@ def cmd_play(args):
     robot_color = chess.WHITE if args.robot_color == "white" else chess.BLACK
     use_camera = not args.manual_moves
     # with --manual-moves the camera is still opened for pick adjustment unless --no-adjust
-    cal, arm, cam, vision, mover = build_game_parts(args, need_camera=use_camera or args.adjust)
+    cal, arm, cam, vision, mover = build_game_parts(args, need_camera=use_camera or args.adjust, find_board=True)
     watcher = CameraWatcher(vision) if use_camera else KeyboardMoves()
     engine = Stockfish(args.stockfish, args.think_time, args.skill)
     board = chess.Board()
@@ -1051,7 +1425,9 @@ def main():
     p.add_argument("--stockfish", default=STOCKFISH_PATH)
     p.add_argument("--think-time", type=float, default=STOCKFISH_THINK_TIME)
     p.add_argument("--skill", type=int, default=STOCKFISH_SKILL_LEVEL)
+    p.add_argument("--no-calibrate", action="store_true", help="play: reuse the saved board position instead of finding it again")
     sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("auto-calibrate", help="find the board by its yellow corners, then hover over a1/h1/h8 to check")
     sub.add_parser("calibrate-board", help="teach a1, h1, h8 by hand-guiding the arm")
     sub.add_parser("calibrate-camera", help="set the viewing pose and click the board corners")
     sub.add_parser("view", help="live detection overlay for tuning")
@@ -1062,6 +1438,7 @@ def main():
     sub.add_parser("play", help="play a game")
     args = p.parse_args()
     {
+        "auto-calibrate": cmd_auto_calibrate,
         "calibrate-board": cmd_calibrate_board,
         "calibrate-camera": cmd_calibrate_camera,
         "view": cmd_view,

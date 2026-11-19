@@ -29,18 +29,52 @@ brakes unlocked, before running anything.
 ## Setup (once per station)
 
 ```bash
-python chess_arm.py calibrate-board    # hand-guide the closed fingertips onto a1, h1, h8
-python chess_arm.py calibrate-camera   # viewing pose + click the 4 outer corners of the playing area
+python chess_arm.py auto-calibrate     # find the board, then hover over a1/h1/h8 so you can check it
 python chess_arm.py view               # live overlay: tune colours / depth until all squares are green
 python chess_arm.py pick-test e2 e4    # move one piece to check the grasp
 ```
 
-Calibration is saved to `chess_calibration.json` next to the script.
+**`play` finds the board by itself every time it starts**, so the board can be moved
+between games. It looks first where the board was last time. `--no-calibrate` skips
+this and reuses the saved position. Calibration is saved to `chess_calibration.json`
+next to the script.
+
+**How the board is found:** the board has yellow corner brackets (at least 3 of the 4
+must be visible). The program finds them, then takes the wood-coloured region between
+them as the board. The grey breadboard is much less saturated than the wood, so it and
+its holes are ignored. The board's outline gives its outer corners. On ranks 4 and 5,
+which are empty in the starting position, the outermost light squares show where the
+thin border ends. Depth gives the board's height and tilt, and which side the robot sits
+on (`--robot-color`) decides which corner is a1. The board can be empty or set up. If the
+board doesn't fit in the camera image, the arm moves higher and tries again.
+
+Colours are set for the lab board and pieces, measured from a photo (H 0-180, S/V 0-255):
+
+| | Setting | Measured |
+|---|---|---|
+| Yellow corners | `CORNER_HSV` | H 24-27, S 230-255, V 220-255 |
+| Dark squares + border | `BOARD_DARK_HSV` | H 7-8, S 118-140, V 125-160 |
+| Light squares | (anything not dark) | H 13-15, S ~60, V ~210 |
+| Light pieces | `WHITE_PIECE_HSV` | H 18-20, S 75-110, V 200-240 |
+| Dark pieces | `BLACK_PIECE_HSV` | H 0-11, S 110-230, V 25-120 |
+
+The RealSense sees colours a bit differently from a phone, so check them with `view`.
+If the board isn't found, open `board_detect_debug.png` (red = board wood, cyan =
+yellow corners). Brown hue wraps around 180, so a range like `(170, ...)` to `(12, ...)`
+means 170-180 and 0-12.
+
+Set before the first run:
+* `CAMERA_MOUNT_OFFSET`, `CAMERA_MOUNT_YAW_DEG`: where the camera sits on the gripper.
+  Any error here shifts the whole board by the same amount.
+* `BOARD_GUESS_CENTRE`: roughly where the board is, for the very first search.
+
+Manual alternative: `calibrate-board` (hand-guide the fingertips onto a1, h1, h8), then
+`calibrate-camera` (click the 4 outer corners of the playing area).
 
 ## Play
 
 ```bash
-python chess_arm.py play                       # robot plays black, colour detection, adjustment on
+python chess_arm.py play                       # finds the board, robot plays black, colour detection
 python chess_arm.py --detect depth play        # use the depth sensor instead of colour
 python chess_arm.py --no-adjust play           # turn off the off-centre/rotation correction
 python chess_arm.py --robot-color white play
