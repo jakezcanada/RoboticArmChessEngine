@@ -1,0 +1,7 @@
+panda-python        # panda-py: Panda arm + gripper (pick the build matching the robot's libfranka version)
+pyrealsense2        # Intel RealSense camera
+opencv-python       # image processing + calibration windows
+chess               # python-chess: rules, move generation, Stockfish (UCI) interface
+numpy
+# Stockfish itself is a separate program: `sudo apt install stockfish`, or download it from
+# https://stockfishchess.org/download/ and set STOCKFISH_PATH.

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# per-station calibration (re-run calibrate-board / calibrate-camera at each station)
+chess_calibration.json
