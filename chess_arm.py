@@ -91,6 +91,9 @@ SPEED_TRAVEL = (0.05, 0.03, 0.08)  # moves at safe height
 SPEED_APPROACH = (0.02, 0.01, 0.05)  # going down to / up from a piece
 HOME_SPEED_FACTOR = 0.2  # move_home() speed; the miniPC allows at most 0.3
 CONFIRM_ROBOT_MOTION = True  # ask "type [yes]" once before the robot first moves
+JOINT_VEL_LIMIT = 0.6525  # rad/s: the miniPC refuses a trajectory faster than this ("JointVelocityAboveMaximumAllowed")
+JOINT_VEL_MARGIN = 0.7  # plan to at most this fraction of the limit
+JOINT_STEP_MAX = 0.05  # rad between two trajectory points; more means IK jumped (e.g. flipped the wrist)
 
 # --- Capture area (in squares, measured from the centre of a1 along the board axes)
 #     Default: two columns beside the h-file, outside the board's border.
@@ -252,6 +255,24 @@ def loc_name(loc) -> str:
 # =============================================================================
 
 
+def slow_down(q_traj: np.ndarray, dt: float) -> np.ndarray:
+    """Stretch a joint trajectory in time (same dt, more points) so no joint goes faster than
+    JOINT_VEL_MARGIN * JOINT_VEL_LIMIT. A Cartesian path can need fast joints near awkward poses."""
+    steps = np.abs(np.diff(q_traj, axis=0))
+    if len(steps) == 0:
+        return q_traj
+    if steps.max() > JOINT_STEP_MAX:
+        raise RuntimeError(f"the joint path jumps {steps.max():.2f} rad in one step (IK flipped); not sending it")
+    k = steps.max() / dt / (JOINT_VEL_MARGIN * JOINT_VEL_LIMIT)
+    if k <= 1.0:
+        return q_traj
+    n = int(math.ceil(len(q_traj) * k))
+    t_old = np.linspace(0.0, 1.0, len(q_traj))
+    t_new = np.linspace(0.0, 1.0, n)
+    print(f"  slowing this move down {k:.1f}x to keep joints under {JOINT_VEL_MARGIN * JOINT_VEL_LIMIT:.2f} rad/s")
+    return np.column_stack([np.interp(t_new, t_old, q_traj[:, j]) for j in range(q_traj.shape[1])])
+
+
 class FrankyArm:
     """The real arm, only through csc376_franky (the miniPC's robot server).
 
@@ -327,7 +348,7 @@ class FrankyArm:
             return  # already there
         traj, dt = self.planner.calculate_cartesian_pose_trajectory(start, target, *speed)
         q_traj = self.planner.cartesian_pose_to_joint_trajectory(self.model, q0, traj)
-        self.robot.run_joint_trajectory(q_traj, dt)
+        self.robot.run_joint_trajectory(slow_down(np.asarray(q_traj, float), dt), dt)
 
     def teaching_mode(self, on: bool):
         sys.exit("Hand-guiding isn't available through the course robot server.")
