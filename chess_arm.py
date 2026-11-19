@@ -105,6 +105,8 @@ CAPTURE_SLOTS_PER_COLUMN = 8
 
 # --- Camera ----------------------------------------------------------------
 CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 1280, 720, 30
+SAVE_FRAMES = True  # save every camera frame this run reads (and each board-detection overlay)
+FRAMES_DIR = Path(__file__).with_name("camera_frames")  # emptied at the start of each run
 WARP_PX_PER_SQUARE = 80  # resolution of the top-down board image
 WARP_MARGIN = 0.5  # squares of border kept around the playing area (used to find the board plane)
 CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unavailable
@@ -420,6 +422,30 @@ class DryRunArm:
 # =============================================================================
 
 
+FRAME_COUNT = [0]
+
+
+def clear_frames():
+    """Empty FRAMES_DIR at the start of a run (only the images this program saves)."""
+    if not SAVE_FRAMES:
+        return
+    FRAMES_DIR.mkdir(exist_ok=True)
+    for f in FRAMES_DIR.glob("*.jpg"):
+        f.unlink()
+    print(f"Saving every camera frame to {FRAMES_DIR}")
+
+
+def save_frame(img, tag: str):
+    """Save one image as camera_frames/<number>_<tag>.jpg (numbered in the order taken)."""
+    if not SAVE_FRAMES:
+        return
+    import cv2
+
+    FRAME_COUNT[0] += 1
+    FRAMES_DIR.mkdir(exist_ok=True)
+    cv2.imwrite(str(FRAMES_DIR / f"{FRAME_COUNT[0]:05d}_{tag}.jpg"), img)
+
+
 class RealSenseCamera:
     def __init__(self):
         import pyrealsense2 as rs
@@ -443,6 +469,7 @@ class RealSenseCamera:
         c, d = frames.get_color_frame(), frames.get_depth_frame()
         intr = c.profile.as_video_stream_profile().intrinsics
         color = np.asanyarray(c.get_data()).copy()
+        save_frame(color, "frame")
         depth = np.asanyarray(d.get_data()).astype(np.float32) * self.depth_scale
         return color, depth, (intr.ppx, intr.ppy)
 
@@ -1097,6 +1124,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
         cv2.circle(debug, tuple(int(x) for x in pt), 8, (0, 0, 255), 2)
     debug_path = Path(__file__).with_name("board_detect_debug.png")
     cv2.imwrite(str(debug_path), debug)
+    save_frame(debug, "detect")
     if len(pts) < 4:
         print(f"  only {len(pts)} of the 4 yellow corners seen (see {debug_path.name}; cyan = yellow)")
         return None
@@ -1156,6 +1184,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     for name, pt in zip(("a1", "h1", "h8", "a8"), inner_px):
         cv2.putText(debug, name, tuple(int(x) for x in pt), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.imwrite(str(debug_path), debug)
+    save_frame(debug, "board")
     print(f"  4 corners found: board centre {np.round(centre, 3)}, checker contrast {contrast:.0f}")
     return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
             "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float),
@@ -1551,6 +1580,7 @@ def main():
     t.add_argument("--piece", default="P", help="piece symbol (P N B R Q K = white, lowercase = black)")
     sub.add_parser("play", help="play a game")
     args = p.parse_args()
+    clear_frames()
     {
         "auto-calibrate": cmd_auto_calibrate,
         "view": cmd_view,

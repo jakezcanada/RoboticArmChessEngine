@@ -45,6 +45,11 @@ between games. It looks first where the board was last time. `--no-calibrate` sk
 this and reuses the saved position. Calibration is saved to `chess_calibration.json`
 next to the script.
 
+**Camera frames:** every frame the program reads is saved to `camera_frames/` as
+`00001_frame.jpg`, `00002_detect.jpg` ... in the order taken (`frame` = raw picture,
+`detect` = yellow found, `board` = with the green outline). The folder is emptied at the
+start of each run (`SAVE_FRAMES` turns it off).
+
 **How the board is found:** only the 4 yellow L-shaped corner brackets are used. The
 board's own colours are not, because they look too much like the table. The inside corner
 of each L is a corner of the board. From home, the bottom-left and bottom-right corners

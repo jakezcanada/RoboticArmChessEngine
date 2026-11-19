@@ -6,3 +6,5 @@ venv/
 chess_calibration.json
 # debug image written by auto-calibrate
 board_detect_debug.png
+# camera frames saved each run (emptied at the start of the next)
+camera_frames/
