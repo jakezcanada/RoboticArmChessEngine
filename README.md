@@ -51,7 +51,7 @@ of each L is a corner of the board. From home, the bottom-left and bottom-right 
 must be in view; the camera shifts forward (`VIEW_FORWARD_STEP`) until all 4 are in the
 image, climbing if the near ones drop out before the far ones appear. Only colour is used:
 the board's known 34 cm size and where its 4 corners appear in the image give its distance
-and tilt (no depth camera). The squares inside must show a checkerboard with a1 dark
+and tilt (no depth camera). The squares inside must show a checkerboard pattern
 (ranks 3-6 are checked, so calibrate before moving pieces there). Corners are named by
 where they are in the camera image (`CORNER_LABELS`): bottom-left h8, bottom-right a8,
 top-left h1, top-right a1. The playing area starts
