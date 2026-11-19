@@ -62,9 +62,11 @@ DETECTION_MODE = "color"  # "color" or "depth"
 ENABLE_PICK_ADJUSTMENT = True  # correct grasps for off-centre / rotated pieces
 VERIFY_ROBOT_MOVES = True  # after the robot moves, check the board with the camera
 
-# --- Board (ESTIMATE; the real size is measured by auto-calibrate) --------
+# --- Board (measured on the lab board) ------------------------------------
 INCH = 0.0254
-SQUARE_SIZE = 1.5 * INCH  # only used to warn if the calibration looks wrong
+SQUARE_SIZE = 0.040  # playing square (m); used to warn if the calibration looks wrong
+BOARD_BORDER = 0.010  # border between the yellow corners and the playing squares (m)
+BOARD_WIDTH = 8 * SQUARE_SIZE + 2 * BOARD_BORDER  # 0.34 m, outer corner to outer corner
 
 # --- Pieces (ESTIMATES for a set that fits 1.5" squares, in metres) --------
 P, N, B, R, Q, K = chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
@@ -115,8 +117,7 @@ CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in t
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
 CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
-BOARD_BORDER_FRACTION = 0.030  # border width / board width (outer edge to outer edge). Measured on a photo of
-#                                the lab board: 0.028-0.033. The playing area starts this far in from the corners.
+BOARD_BORDER_FRACTION = BOARD_BORDER / BOARD_WIDTH  # 1 cm / 34 cm: the playing area starts this far in from the corners
 VIEW_MARGIN = 0.02  # the outer board corners end up this fraction of the image width/height in from its edges
 VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
 #                          climb this much and keep shifting forward
@@ -1086,6 +1087,9 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
         cv2.putText(debug, name, tuple(int(x) for x in pt), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.imwrite(str(debug_path), debug)
     print(f"  4 corners found: square {sq * 1000:.1f} mm, board centre {np.round(centre, 3)}")
+    if abs(np.mean(sides) - BOARD_WIDTH) > 0.05 * BOARD_WIDTH:
+        print(f"  WARNING: board measured {np.mean(sides) * 1000:.0f} mm wide, expected {BOARD_WIDTH * 1000:.0f} mm "
+              "(check the camera depth / CAMERA_MOUNT_OFFSET)")
     return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
             "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float)}
 

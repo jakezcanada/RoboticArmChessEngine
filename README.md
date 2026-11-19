@@ -49,7 +49,7 @@ of each L is a corner of the board. From home, the bottom-left and bottom-right 
 must be in view; the camera shifts forward (`VIEW_FORWARD_STEP`) until all 4 are in the
 image, climbing if the near ones drop out before the far ones appear. Depth gives the board's height and tilt, and which side the robot
 sits on (`--robot-color`) decides which corner is a1. The playing area starts
-`BOARD_BORDER_FRACTION` (3% of the board width, measured from a photo) in from the corners.
+`BOARD_BORDER` (1 cm) in from the corners; squares are 4 cm (`SQUARE_SIZE`), so the board is 34 cm.
 
 **The camera then fits itself to the board:** it moves straight above the board's centre,
 turns square to it, and goes to whatever height puts the 4 corners at the edges of the
