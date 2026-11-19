@@ -1043,7 +1043,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
     color, depth, _ = cam.read()
     mask = corner_mask(color)
     pts = bracket_corners(mask)
-    locate_board.seen = len(pts)
+    locate_board.seen, locate_board.pts = len(pts), [np.asarray(q, float) for q in pts]
     debug = color.copy()
     debug[mask] = (255, 255, 0)
     for pt in pts:
@@ -1134,9 +1134,24 @@ def view_pose_for(found, intrinsics, R_down):
     return cam_pos - R_ee @ mount_offset(), yaw, h
 
 
+def near_corners_in_view(arm, fwd) -> bool:
+    """Whether any yellow corner from the last locate_board is on the near (robot) side of the image.
+    Moving the camera forward makes the scene slide towards the near side, so that side is where
+    -fwd points in the image."""
+    R_cam = camera_pose(arm.pose)[:3, :3]
+    d = R_cam.T @ -fwd  # direction the scene slides, camera frame
+    d_img = d[:2] / (np.linalg.norm(d[:2]) or 1.0)
+    centre = np.array([CAMERA_WIDTH / 2, CAMERA_HEIGHT / 2])
+    return any((q - centre) @ d_img > 0 for q in locate_board.pts)
+
+
 def search_board(arm, cam: RealSenseCamera, robot_white: bool):
     """From home (bottom-left and bottom-right corners in view), shift the camera forward until
-    all 4 yellow corners are in the image. Climbs if the board doesn't fit. Returns locate_board's dict or None."""
+    all 4 yellow corners are in the image. Returns locate_board's dict or None.
+
+    If a step overshoots (the near corners drop out, or 4 corners are seen but don't form a
+    square), it tries halfway between the last good spot and the overshoot, narrowing down.
+    If the gap closes without a fit, the board doesn't fit at this height: it climbs."""
     start = arm.pose[:3, 3].copy()
     fwd = np.array([*VIEW_FORWARD, 0.0], float)
     fwd /= np.linalg.norm(fwd)
@@ -1144,23 +1159,48 @@ def search_board(arm, cam: RealSenseCamera, robot_white: bool):
         return found
     if locate_board.seen < 2:
         print("  WARNING: the bottom-left and bottom-right yellow corners should be in view from home.")
-    shift, up, seen_two = 0.0, 0.0, locate_board.seen >= 2
-    while shift < VIEW_FORWARD_MAX:
-        if seen_two and locate_board.seen < 2:  # near corners left the image before the far ones came in
+    saw_two = locate_board.seen >= 2 and near_corners_in_view(arm, fwd)
+    lo, hi, up = 0.0, None, 0.0  # lo: last shift with the near corners in view; hi: first overshoot
+    shift, climb = 0.0, False
+    for _ in range(40):
+        if climb:  # same shift, higher up
+            climb = False
+        elif hi is None:
+            shift = lo + VIEW_FORWARD_STEP
+        elif hi - lo < 0.005:  # narrowed to 5 mm without a fit
             up += VIEW_SEARCH_STEP
-            seen_two = False
+            shift, hi, climb = lo, None, True
             print(f"  the board doesn't fit at this height; going {VIEW_SEARCH_STEP * 100:.0f} cm higher")
+            continue
         else:
-            shift += VIEW_FORWARD_STEP
-        print(f"Shifting the camera forward: {shift * 100:.0f} cm from home, {up * 100:.0f} cm up.")
+            shift = (lo + hi) / 2
+        if shift > VIEW_FORWARD_MAX:
+            return None
+        print(f"Shifting the camera: {shift * 100:.1f} cm forward of home, {up * 100:.0f} cm up.")
         try:
             arm.move_to(start + fwd * shift + [0, 0, up])
         except Exception as e:  # noqa: BLE001 - out of reach
             print(f"  can't move there ({e})")
             return None
+        time.sleep(0.3)  # let the camera settle
         if (found := locate_board(arm, cam, robot_white)) is not None:
             return found
-        seen_two = seen_two or locate_board.seen >= 2
+        seen, near = locate_board.seen, near_corners_in_view(arm, fwd)
+        if seen >= 4 or (saw_two and not near):
+            print("  overshot (near corners lost, or the 4 corners don't form a square); trying between")
+            hi = shift
+        else:
+            lo = shift
+            saw_two = saw_two or (seen >= 2 and near)
+    return None
+
+
+def settle_and_locate(arm, cam, robot_white, tries=3):
+    """locate_board, giving the camera a moment to settle (exposure, vibration) after a move."""
+    for _ in range(tries):
+        time.sleep(0.5)
+        if (found := locate_board(arm, cam, robot_white)) is not None:
+            return found
     return None
 
 
@@ -1192,18 +1232,29 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
                 break
             print(f"Zooming to the board: camera {h:.2f} m above it, turned {math.degrees(yaw):.0f} deg.")
             q_before = arm.q
+            T_before = arm.pose
+            p_before = T_before[:3, 3].copy()
+            M = T_before[:3, :3] @ cal.R_down.T  # = rot_z(current yaw)
+            yaw_before = math.atan2(M[1, 0], M[0, 0])
             try:
                 arm.move_to(target, yaw)
             except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
                 print(f"  can't move there ({e}); keeping the current view")
                 break
-            again = None
-            for _try in range(3):  # give the camera a moment to settle (exposure, vibration) after the move
-                time.sleep(0.5)
-                if (again := locate_board(arm, cam, robot_white)) is not None:
+            again = settle_and_locate(arm, cam, robot_white)
+            # lost them (too far, or not a square any more): try partway between the last good view and the target
+            for frac in (0.5, 0.25):
+                if again is not None:
                     break
+                print(f"  lost the corners there; trying {frac:.0%} of the way")
+                try:
+                    arm.move_to(p_before + frac * (target - p_before), yaw_before + frac * (yaw - yaw_before))
+                except Exception as e:  # noqa: BLE001
+                    print(f"  can't move there ({e})")
+                    continue
+                again = settle_and_locate(arm, cam, robot_white)
             if again is None:
-                print("  lost the corners after moving; going back to the last good view")
+                print("  going back to the last good view")
                 arm.move_joints(q_before)
                 break
             found = again
