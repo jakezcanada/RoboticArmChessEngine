@@ -123,7 +123,7 @@ CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from
 CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
 BOARD_BORDER_FRACTION = BOARD_BORDER / BOARD_WIDTH  # 1 cm / 34 cm: the playing area starts this far in from the corners
-VIEW_MARGIN = 0.02  # the outer board corners end up this fraction of the image width/height in from its edges
+VIEW_MARGIN = 0.02  # the yellow markers' outer edges end up this fraction of the image width/height in from its edges
 VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
 #                          climb this much and keep shifting forward
 VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
@@ -1042,6 +1042,7 @@ def bracket_corners(mask) -> list[np.ndarray]:
 
     contours = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
     out = []
+    bracket_corners.hulls = []  # outline (pixels) of each bracket, same order as the corners
     for c in sorted(contours, key=cv2.contourArea, reverse=True):
         if cv2.contourArea(c) < CORNER_MIN_AREA * mask.size:
             break
@@ -1057,12 +1058,14 @@ def bracket_corners(mask) -> list[np.ndarray]:
         if depth / 256 < 3:  # not an L (no real notch)
             continue
         out.append(c[far, 0].astype(float))
+        bracket_corners.hulls.append(cv2.convexHull(c).reshape(-1, 2).astype(float))
     return out
 
 
-def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
+def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool = False):
     """Find the board from where the arm is now, using only the 4 yellow corners.
 
+    ``full_marks``: also require every yellow marker to be wholly inside the image.
     Sets ``locate_board.seen`` to how many yellow corners were in the image. Returns a dict (a1, h1, h8, axes = (ex, ey, n, square), outer = board corners a1/h1/h8/a8
     side in the base frame, outer_px / image_corners = pixels of the board / playing-area
     corners) or None."""
@@ -1083,6 +1086,11 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
         return None
     pts = np.array(pts[:4])
     h_img, w_img = mask.shape
+    hull_px = np.vstack(bracket_corners.hulls[:4])  # the whole yellow markers
+    if full_marks and (hull_px[:, 0].min() < 3 or hull_px[:, 1].min() < 3 or
+                       hull_px[:, 0].max() > w_img - 4 or hull_px[:, 1].max() > h_img - 4):
+        print("  a yellow marker is cut off by the image edge")
+        return None
     if pts[:, 0].min() < 3 or pts[:, 1].min() < 3 or pts[:, 0].max() > w_img - 4 or pts[:, 1].max() > h_img - 4:
         print("  a corner is at the edge of the image")
         return None
@@ -1096,6 +1104,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
         return None
     cam_T = camera_pose(arm.pose)
     Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # board corners, base frame
+    marks = on_plane(hull_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # marker outlines, base frame
     sides = [np.linalg.norm(Q[(i + 1) % 4] - Q[i]) for i in range(4)]
     diags = [np.linalg.norm(Q[2] - Q[0]), np.linalg.norm(Q[3] - Q[1])]
     if max(sides) / min(sides) > 1.15 or max(diags) / min(diags) > 1.1:
@@ -1136,12 +1145,14 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
         print(f"  WARNING: board measured {np.mean(sides) * 1000:.0f} mm wide, expected {BOARD_WIDTH * 1000:.0f} mm "
               "(check the camera depth / CAMERA_MOUNT_OFFSET)")
     return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
-            "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float)}
+            "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float),
+            "marks": marks, "marks_px": hull_px}
 
 
 def view_pose_for(found, intrinsics, R_down):
     """Gripper (position, yaw) that puts the camera straight above the board centre, turned square
-    to the board, at the height where the 4 corners fill the image with VIEW_MARGIN to spare."""
+    to the board, at the height where the 4 yellow markers (whole, not just the board corners)
+    fill the image with VIEW_MARGIN to spare."""
     fx, fy, cx, cy = intrinsics
     ex, ey, n, _ = found["axes"]
     Q = found["outer"]
@@ -1152,8 +1163,14 @@ def view_pose_for(found, intrinsics, R_down):
     turn = math.atan2(ex[1], ex[0]) - math.atan2(cam_x0[1], cam_x0[0])
     yaw = (turn + math.pi / 4) % (math.pi / 2) - math.pi / 4
     R_cam = rot_z(yaw) @ R_down @ R_mount
-    half_x = np.abs((Q - centre) @ R_cam[:, 0]).max()
-    half_y = np.abs((Q - centre) @ R_cam[:, 1]).max()
+    # The markers stick out past the board corners. A marker cut off by the image edge looks
+    # smaller, so take the overhang of the one sticking out furthest and apply it to all 4 corners.
+    half_side = max(np.abs((Q - centre) @ ex).max(), np.abs((Q - centre) @ ey).max())
+    d = found["marks"] - centre
+    r = max(half_side, np.maximum(np.abs(d @ ex), np.abs(d @ ey)).max())
+    edge = np.array([centre + r * (sx * ex + sy * ey) for sx in (-1, 1) for sy in (-1, 1)])
+    half_x = np.abs((edge - centre) @ R_cam[:, 0]).max()
+    half_y = np.abs((edge - centre) @ R_cam[:, 1]).max()
     room_x = min(cx, CAMERA_WIDTH - cx) - VIEW_MARGIN * CAMERA_WIDTH  # pixels from the image centre to the margin
     room_y = min(cy, CAMERA_HEIGHT - cy) - VIEW_MARGIN * CAMERA_HEIGHT
     h = float(max(fx * half_x / room_x, fy * half_y / room_y))  # no fixed height: whatever makes the board fill the image
@@ -1227,7 +1244,7 @@ def settle_and_locate(arm, cam, robot_white, tries=3):
     """locate_board, giving the camera a moment to settle (exposure, vibration) after a move."""
     for _ in range(tries):
         time.sleep(0.5)
-        if (found := locate_board(arm, cam, robot_white)) is not None:
+        if (found := locate_board(arm, cam, robot_white, full_marks=True)) is not None:
             return found
     return None
 
@@ -1287,8 +1304,12 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
                 break
             found = again
 
-        px = found["outer_px"]
-        print(f"The corners span x {px[:, 0].min():.0f}-{px[:, 0].max():.0f}, "
+        if (whole := settle_and_locate(arm, cam, robot_white, tries=1)) is not None:
+            found = whole
+        else:
+            print("  WARNING: not all 4 yellow markers are wholly in the image from here")
+        px = found["marks_px"]
+        print(f"The yellow markers span x {px[:, 0].min():.0f}-{px[:, 0].max():.0f}, "
               f"y {px[:, 1].min():.0f}-{px[:, 1].max():.0f} of the {CAMERA_WIDTH}x{CAMERA_HEIGHT} image "
               "(see board_detect_debug.png).")
         answer = input("Are all 4 yellow corners in frame and is this a good view of the board? "
