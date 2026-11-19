@@ -5,7 +5,7 @@ A Franka Emika Panda plays chess against a person. Everything is in one file,
 
 | Part | Where in `chess_arm.py` |
 |---|---|
-| Arm and gripper motion (panda-py) | `PandaArm`, `ChessMover` |
+| Arm and gripper motion (csc376_franky, through the station miniPC) | `FrankyArm`, `ChessMover` |
 | Detecting pieces (RealSense on the gripper, **color** or **depth**) | `BoardVision` |
 | Correcting the grasp for off-centre / turned pieces (on/off) | `PickAdjuster` |
 | Detecting the other player's move | `CameraWatcher`, `infer_move` |
@@ -22,9 +22,13 @@ pip install -r requirements.txt
 sudo apt install stockfish        # or set STOCKFISH_PATH to the executable
 ```
 
-Install the `panda-python` build that matches the robot's libfranka version (see
-the panda-py releases page). FCI must be activated in Franka Desk, and the
-brakes unlocked, before running anything.
+The arm is driven only through the course robot server on the station's miniPC
+(`csc376_franky`), never libfranka directly. Install `csc376_franky` the way the course
+says. Each move is planned on this PC, like the course examples: Ruckig makes a smooth
+path, the roboticstoolbox Panda model turns it into joint angles, and the miniPC runs it.
+The program asks you to type `yes` once before the robot first moves
+(`CONFIRM_ROBOT_MOTION`). Speeds are `SPEED_TRAVEL` / `SPEED_APPROACH` (Ruckig fractions)
+and `HOME_SPEED_FACTOR` (at most 0.3).
 
 ## Setup (once per station)
 
@@ -69,8 +73,7 @@ Set before the first run:
   Any error here shifts the whole board by the same amount.
 * `BOARD_GUESS_CENTRE`: roughly where the board is, for the very first search.
 
-Manual alternative: `calibrate-board` (hand-guide the fingertips onto a1, h1, h8), then
-`calibrate-camera` (click the 4 outer corners of the playing area).
+Hand-guiding isn't available through the course server, so there is no manual calibration.
 
 ## Play
 
@@ -128,7 +131,6 @@ camera uses to watch the board:
 
 ## Things to measure and adjust first
 
-* `ROBOT_IP`
 * `PIECE_HEIGHT`, `PIECE_GRIP_WIDTH`, `PIECE_BASE_DIAMETER` (the grasp height is
   `GRASP_HEIGHT_FRACTION` of the piece height)
 * `SQUARE_SIZE` (only used to warn if calibration looks wrong)

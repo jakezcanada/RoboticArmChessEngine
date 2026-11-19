@@ -1,7 +1,10 @@
-panda-python        # panda-py: Panda arm + gripper (pick the build matching the robot's libfranka version)
-pyrealsense2        # Intel RealSense camera
-opencv-python       # image processing + calibration windows
-chess               # python-chess: rules, move generation, Stockfish (UCI) interface
+# csc376_franky: the course robot-server client (talks to the station's miniPC; never libfranka
+#   directly). Install it the way the course says; it is not on PyPI.
+roboticstoolbox-python  # Panda model: forward/inverse kinematics for planning moves
+spatialmath-python      # SE3 poses for the motion generator
+pyrealsense2            # Intel RealSense camera
+opencv-python           # image processing
+chess                   # python-chess: rules, move generation, Stockfish (UCI) interface
 numpy
 # Stockfish itself is a separate program: `sudo apt install stockfish`, or download it from
 # https://stockfishchess.org/download/ and set STOCKFISH_PATH.

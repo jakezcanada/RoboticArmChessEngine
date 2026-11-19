@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Play chess against a Franka Emika Panda.
 
-One file that runs on the robot PC. It:
-  * moves the arm and gripper (panda-py)
+One file that runs on the station PC. It:
+  * moves the arm and gripper through the course robot server on the station's miniPC
+    (csc376_franky; never libfranka directly). Moves are planned here with Ruckig and the
+    roboticstoolbox Panda model, then sent to the miniPC as joint trajectories.
   * detects the pieces on the board with the gripper-mounted RealSense,
     either by COLOR (default) or by DEPTH
   * detects when the other player has moved
@@ -13,7 +15,6 @@ One file that runs on the robot PC. It:
 Workflow (run each step once per setup, then play):
     python chess_arm.py auto-calibrate       find the board with the camera (yellow corners) and check it;
                                              `play` also finds the board by itself every time it starts
-    (manual alternative: calibrate-board, then calibrate-camera)
     python chess_arm.py view                 live detection overlay, for tuning the variables below
     python chess_arm.py pick-test e2 e4      move one piece, to test grasping
     python chess_arm.py play                 play a game
@@ -48,7 +49,6 @@ import numpy as np
 # CONFIGURATION
 # =============================================================================
 
-ROBOT_IP = "192.168.1.107"  # Panda FCI address
 CALIBRATION_FILE = Path(__file__).with_name("chess_calibration.json")
 
 # --- Stockfish -------------------------------------------------------------
@@ -62,7 +62,7 @@ DETECTION_MODE = "color"  # "color" or "depth"
 ENABLE_PICK_ADJUSTMENT = True  # correct grasps for off-centre / rotated pieces
 VERIFY_ROBOT_MOVES = True  # after the robot moves, check the board with the camera
 
-# --- Board (ESTIMATE; the real size is measured by calibrate-board) --------
+# --- Board (ESTIMATE; the real size is measured by auto-calibrate) --------
 INCH = 0.0254
 SQUARE_SIZE = 1.5 * INCH  # only used to warn if the calibration looks wrong
 
@@ -73,9 +73,11 @@ PIECE_BASE_DIAMETER = {P: 0.022, N: 0.025, B: 0.024, R: 0.024, Q: 0.027, K: 0.02
 PIECE_GRIP_WIDTH = {P: 0.014, N: 0.016, B: 0.014, R: 0.018, Q: 0.016, K: 0.017}  # at grasp height
 GRASP_HEIGHT_FRACTION = 0.5  # grasp this far up the piece
 MIN_GRASP_HEIGHT = 0.012  # never put the fingertips lower than this above the board
-GRIP_FORCE = 15.0  # N
+GRIP_FORCE = 15.0  # N (only used if csc376_franky's Gripper has a grasp() call)
 GRIP_SPEED = 0.05  # m/s
 GRIP_EPSILON = 0.010  # accepted difference between PIECE_GRIP_WIDTH and the real width
+GRIP_SQUEEZE = 0.004  # without grasp(): close this much narrower than the piece, so the fingers press on it
+GRIPPER_MAX_WIDTH = 0.08  # Franka Hand fully open
 OPEN_CLEARANCE = 0.020  # open this much wider than the piece base before descending
 
 # --- Motion ----------------------------------------------------------------
@@ -83,8 +85,12 @@ SAFE_HEIGHT = 0.12  # travel height above the board (clears the king)
 VIEW_HEIGHT = 0.50  # gripper height above the board for the first look. auto-calibrate then picks the
 #                    viewing height itself, so that the 4 yellow corners just fit in the image.
 PLACE_EXTRA_HEIGHT = 0.003  # release this much higher than the grasp height
-SPEED_TRAVEL = 0.15  # panda-py speed_factor for moves at safe height
-SPEED_APPROACH = 0.06  # speed_factor for going down to / up from a piece
+# Speeds are Ruckig (velocity, acceleration, jerk) fractions of the Panda's limits, as in the
+# csc376_franky examples (they use 0.02, 0.01, 0.05). Start slow; raise only after testing.
+SPEED_TRAVEL = (0.05, 0.03, 0.08)  # moves at safe height
+SPEED_APPROACH = (0.02, 0.01, 0.05)  # going down to / up from a piece
+HOME_SPEED_FACTOR = 0.2  # move_home() speed; the miniPC allows at most 0.3
+CONFIRM_ROBOT_MOTION = True  # ask "type [yes]" once before the robot first moves
 
 # --- Capture area (in squares, measured from the centre of a1 along the board axes)
 #     Default: two columns beside the h-file, outside the board's border.
@@ -112,7 +118,9 @@ CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image 
 BOARD_BORDER_FRACTION = 0.030  # border width / board width (outer edge to outer edge). Measured on a photo of
 #                                the lab board: 0.028-0.033. The playing area starts this far in from the corners.
 VIEW_MARGIN = 0.08  # free space left around the 4 corners, as a fraction of the image width/height on each side
-VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT = 0.25, 0.85  # allowed camera heights above the board (m)
+VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT = 0.25, 0.68  # allowed camera heights above the board (m); the Panda
+#                                               can't reach much higher with the gripper pointing down
+VIEW_SEARCH_EXTRA = (0.0, 0.07, 0.14)  # if the corners aren't all seen, look again this much higher
 VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
 #  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
 AUTO_CAL_HOVER = 0.010  # check height: the fingertips stop this far above a1, h1 and h8
@@ -155,26 +163,6 @@ def rot_z(a: float) -> np.ndarray:
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
 
 
-def quat_xyzw(Rm: np.ndarray) -> np.ndarray:
-    """Rotation matrix -> quaternion (x, y, z, w), the order panda-py uses."""
-    m = Rm
-    tr = m[0, 0] + m[1, 1] + m[2, 2]
-    if tr > 0:
-        s = 2 * math.sqrt(tr + 1)
-        w, x, y, z = 0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = 2 * math.sqrt(1 + m[0, 0] - m[1, 1] - m[2, 2])
-        w, x, y, z = (m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = 2 * math.sqrt(1 + m[1, 1] - m[0, 0] - m[2, 2])
-        w, x, y, z = (m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s
-    else:
-        s = 2 * math.sqrt(1 + m[2, 2] - m[0, 0] - m[1, 1])
-        w, x, y, z = (m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s
-    q = np.array([x, y, z, w])
-    return q / np.linalg.norm(q)
-
-
 @dataclass
 class Calibration:
     a1: np.ndarray | None = None  # fingertip position touching the centre of a1 (robot base frame)
@@ -199,7 +187,7 @@ class Calibration:
     def require(self, *names):
         missing = [n for n in names if getattr(self, n) is None]
         if missing:
-            sys.exit(f"Calibration is missing {missing}. Run calibrate-board / calibrate-camera first.")
+            sys.exit(f"Calibration is missing {missing}. Run auto-calibrate first.")
 
 
 class BoardFrame:
@@ -250,62 +238,108 @@ def loc_name(loc) -> str:
 
 
 # =============================================================================
-# ARM (panda-py)
+# ARM (csc376_franky: the course robot server on the station's miniPC)
 # =============================================================================
 
 
-class PandaArm:
-    """Thin wrapper around panda-py so the rest of the program only needs these calls."""
+class FrankyArm:
+    """The real arm, only through csc376_franky (the miniPC's robot server).
 
-    def __init__(self, ip: str, R_down: np.ndarray | None):
-        import panda_py
-        from panda_py import libfranka
+    Each gripper move is planned here like the course examples do: Ruckig makes a smooth
+    Cartesian path, the roboticstoolbox Panda model turns it into joint angles (starting from
+    the angles read just before, because the miniPC refuses a trajectory if the robot moved
+    since), and the miniPC runs it."""
 
-        self.panda = panda_py.Panda(ip)
-        self.gripper = libfranka.Gripper(ip)
+    def __init__(self, R_down: np.ndarray | None):
+        import roboticstoolbox as rtb
+        from csc376_franky import FrankaJointTrajectoryController, Gripper
+        from csc376_franky.motion_generator import RuckigMotionGenerator
+
+        self.robot = FrankaJointTrajectoryController()  # this station's miniPC
+        self.gripper = Gripper()
+        self.model = rtb.models.Panda()
+        self.planner = RuckigMotionGenerator()
         self.R_down = R_down
-        self.gripper.homing()
+        self._check_tool_frame()
+        if CONFIRM_ROBOT_MOTION:
+            print("The robot will now move by itself (home, over the board, picking pieces). Check the way is clear.")
+            if input("To allow the real robot to move, type [yes], then press enter\n") != "yes":
+                sys.exit("User did not type [yes]; not moving the real robot.")
+
+    def _check_tool_frame(self):
+        """Warn if the robot's end-effector frame and the model's differ (fingertip positions would be off)."""
+        try:
+            O_T_EE = np.array(self.robot.get_current_robot_state().O_T_EE).reshape(4, 4).T
+        except Exception as e:  # noqa: BLE001 - only a check
+            print(f"  (couldn't read the robot's end-effector pose to compare: {e})")
+            return
+        gap = np.linalg.norm(O_T_EE[:3, 3] - self.pose[:3, 3])
+        if gap > 0.005:
+            print(f"WARNING: the robot's end-effector is {gap * 1000:.0f} mm from the roboticstoolbox model's "
+                  "fingertip point. Positions will be off by about that much; check the end-effector set in Desk.")
 
     # state
     @property
     def q(self) -> np.ndarray:
-        return np.array(self.panda.q)
+        return np.array(self.robot.get_current_joint_positions(), float)
 
     @property
     def pose(self) -> np.ndarray:
-        return np.array(self.panda.get_pose())
+        """Fingertip pose (4x4, base frame) from the joint angles and the roboticstoolbox Panda model."""
+        return np.array(self.model.fkine(self.q).A)
 
     # motion
-    def _retry(self, fn, *a, **kw):
-        try:
-            return fn(*a, **kw)
-        except Exception as e:  # reflex / communication error: recover once and retry
-            print(f"  arm error: {e}; recovering and retrying")
-            self.panda.recover()
-            return fn(*a, **kw)
-
     def home(self):
-        self._retry(self.panda.move_to_start, speed_factor=SPEED_TRAVEL)
+        self.robot.move_home(HOME_SPEED_FACTOR)
 
     def move_joints(self, q, speed=SPEED_TRAVEL):
-        self._retry(self.panda.move_to_joint_position, np.asarray(q), speed_factor=speed)
+        """Go to the gripper pose these joint angles give (there's no plain joint move in the examples)."""
+        self._move_pose(np.array(self.model.fkine(np.asarray(q, float)).A), speed)
 
     def move_to(self, position, yaw: float = 0.0, speed=SPEED_TRAVEL):
         """Move the fingertips to ``position`` pointing down, turned ``yaw`` rad about vertical."""
         if self.R_down is None:
-            sys.exit("No gripper-down orientation; run calibrate-board first.")
-        q = quat_xyzw(rot_z(yaw) @ self.R_down)
-        self._retry(self.panda.move_to_pose, np.asarray(position, float), q, speed_factor=speed)
+            sys.exit("No gripper-down orientation; run auto-calibrate first.")
+        T = np.eye(4)
+        T[:3, :3] = rot_z(yaw) @ self.R_down
+        T[:3, 3] = position
+        self._move_pose(T, speed)
+
+    def _move_pose(self, T, speed):
+        from spatialmath import SE3, SO3
+
+        q0 = self.q  # read right before planning
+        start = self.model.fkine(q0)
+        R = T[:3, :3]
+        u, _, vt = np.linalg.svd(R)  # keep the rotation exactly orthonormal for spatialmath
+        target = SE3.Rt(SO3(u @ vt, check=False), T[:3, 3])
+        if np.linalg.norm(start.t - target.t) < 0.0005 and np.linalg.norm(start.R - target.R) < 1e-3:
+            return  # already there
+        traj, dt = self.planner.calculate_cartesian_pose_trajectory(start, target, *speed)
+        q_traj = self.planner.cartesian_pose_to_joint_trajectory(self.model, q0, traj)
+        self.robot.run_joint_trajectory(q_traj, dt)
 
     def teaching_mode(self, on: bool):
-        self.panda.teaching_mode(on)
+        sys.exit("Hand-guiding isn't available through the course robot server.")
 
     # gripper
     def open(self, width: float):
-        self.gripper.move(min(width, 0.08), GRIP_SPEED * 2)
+        self.gripper.move(min(max(width, 0.0), GRIPPER_MAX_WIDTH), GRIP_SPEED * 2)
 
     def grasp(self, width: float) -> bool:
-        return bool(self.gripper.grasp(width, GRIP_SPEED, GRIP_FORCE, GRIP_EPSILON, GRIP_EPSILON))
+        """Close on a piece about ``width`` wide. True if it is held."""
+        g = self.gripper
+        if hasattr(g, "grasp"):  # not in the examples; used if the course Gripper has it (libfranka-style)
+            try:
+                return bool(g.grasp(width, GRIP_SPEED, GRIP_FORCE, GRIP_EPSILON, GRIP_EPSILON))
+            except TypeError:
+                pass
+        try:
+            g.move(max(width - GRIP_SQUEEZE, 0.0), GRIP_SPEED)
+        except Exception:  # noqa: BLE001 - a move that stops on the piece may report failure
+            pass
+        st = g.state
+        return bool(getattr(st, "is_grasped", False)) or st.width > width - GRIP_EPSILON
 
 
 class DryRunArm:
@@ -1082,19 +1116,6 @@ def view_pose_for(found, intrinsics, R_down):
     return cam_pos - R_ee @ np.asarray(CAMERA_MOUNT_OFFSET), yaw, h
 
 
-def teach_points(arm, cal: Calibration, names=("a1", "h1", "h8")):
-    """Hand-guide the closed fingertips onto squares to record their positions."""
-    arm.open(0.0)  # closed fingers = a single point to touch the board with
-    arm.teaching_mode(True)
-    try:
-        for name in names:
-            input(f"Guide the closed fingertips onto the CENTRE of {name}, touching the board, then press Enter.")
-            setattr(cal, name, arm.pose[:3, 3].copy())
-            print(f"  {name} = {np.round(getattr(cal, name), 4)}")
-    finally:
-        arm.teaching_mode(False)
-
-
 def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: bool = True):
     """Find the board with the camera and fill in a1, h1, h8, R_down, q_view and image_corners.
 
@@ -1108,19 +1129,19 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
     cal.R_down = arm.pose[:3, :3]
     arm.R_down = cal.R_down
     found = None
-    for extra in (0.0, 0.15, 0.30):  # go higher if the 4 corners don't fit in the image
-        print(f"Looking for the 4 yellow corners from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
-        arm.move_to(look_at + [0, 0, VIEW_HEIGHT + extra])
-        if (found := locate_board(arm, cam, robot_white)) is not None:
-            break
     while found is None:
-        if input("Corners not found. Hand-guide the camera over the board and try again? [Y/n] ").strip().lower() == "n":
-            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE and CORNER_HSV "
-                     "(see board_detect_debug.png), or use calibrate-board / calibrate-camera.")
-        arm.teaching_mode(True)
-        input("Move the arm so the camera sees all 4 yellow corners from above, then press Enter.")
-        arm.teaching_mode(False)
-        found = locate_board(arm, cam, robot_white)
+        for extra in VIEW_SEARCH_EXTRA:  # go higher if the 4 corners don't fit in the image
+            print(f"Looking for the 4 yellow corners from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
+            try:
+                arm.move_to(look_at + [0, 0, VIEW_HEIGHT + extra])
+            except Exception as e:  # noqa: BLE001 - e.g. out of reach: try the next height
+                print(f"  can't move there ({e})")
+                continue
+            if (found := locate_board(arm, cam, robot_white)) is not None:
+                break
+        if found is None and input("Corners not found. Make sure all 4 yellow corners are uncovered and the board "
+                                   "is near BOARD_GUESS_CENTRE, then press Enter to look again (q = quit) ").strip() == "q":
+            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE and CORNER_HSV (see board_detect_debug.png).")
 
     # adjust the camera until the 4 corners fit the image: centred, square to it, right height
     for _ in range(4):
@@ -1130,7 +1151,11 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
             break
         print(f"Adjusting the view: camera {h:.2f} m above the board, turned {math.degrees(yaw):.0f} deg.")
         q_before = arm.q
-        arm.move_to(target, yaw)
+        try:
+            arm.move_to(target, yaw)
+        except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
+            print(f"  can't move there ({e}); keeping the current view")
+            break
         again = locate_board(arm, cam, robot_white)
         if again is None:
             print("  lost the corners after moving; going back to the last good view")
@@ -1155,10 +1180,9 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
             time.sleep(1.0)
             arm.move_to(p + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
         if input("Were the fingertips over the centres of a1, h1 and h8? [Y/n] ").strip().lower() == "n":
-            print("Teach the three squares by hand instead (the camera calibration is kept).")
-            teach_points(arm, cal)
-            board = BoardFrame(cal)
-            arm.move_to(board.centre(SAFE_HEIGHT))
+            arm.move_joints(cal.q_view)
+            sys.exit("Not saved. If every point was off the same way, fix CAMERA_MOUNT_OFFSET / CAMERA_MOUNT_YAW_DEG; "
+                     "if they were off towards/away from the edges, fix BOARD_BORDER_FRACTION. Then run auto-calibrate again.")
     print(f"Square size {board.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, board.ez[2]))):.1f} deg.")
     if last is not None:
         print(f"The board moved {np.linalg.norm(board.centre() - last) * 1000:.0f} mm since the last calibration.")
@@ -1184,74 +1208,7 @@ def cmd_auto_calibrate(args):
 
 
 def make_arm(args, cal):
-    return DryRunArm(cal.R_down) if args.dry_run else PandaArm(args.ip, cal.R_down)
-
-
-def cmd_calibrate_board(args):
-    cal = Calibration.load()
-    arm = make_arm(args, cal)
-    print("Moving to the start pose to record the 'gripper pointing down' orientation.")
-    arm.home()
-    cal.R_down = arm.pose[:3, :3]
-    arm.R_down = cal.R_down
-    teach_points(arm, cal)
-    b = BoardFrame(cal)
-    print(f"Square size {b.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, b.ez[2]))):.1f} deg.")
-    cal.save()
-    arm.move_to(b.centre(SAFE_HEIGHT))
-
-
-def click_corners(image):
-    import cv2
-
-    names = ["a1", "h1", "h8", "a8"]
-    pts = []
-    win = "Click the OUTER corner of the playing area at each square shown"
-
-    def on_click(event, x, y, *_):
-        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
-            pts.append((x, y))
-
-    cv2.namedWindow(win)
-    cv2.setMouseCallback(win, on_click)
-    while len(pts) < 4:
-        img = image.copy()
-        for p in pts:
-            cv2.circle(img, p, 6, (0, 0, 255), -1)
-        cv2.putText(img, f"click corner of {names[len(pts)]}  (r = restart)", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        cv2.imshow(win, img)
-        k = cv2.waitKey(30) & 0xFF
-        if k == ord("r"):
-            pts.clear()
-        if k == 27:
-            sys.exit("Cancelled")
-    cv2.destroyWindow(win)
-    return np.array(pts, float)
-
-
-def cmd_calibrate_camera(args):
-    import cv2
-
-    cal = Calibration.load()
-    board = BoardFrame(cal)
-    arm = make_arm(args, cal)
-    print(f"Moving {VIEW_HEIGHT} m above the board centre.")
-    arm.move_to(board.centre(VIEW_HEIGHT))
-    if input("Hand-guide to a better viewing pose first? [y/N] ").strip().lower() == "y":
-        arm.teaching_mode(True)
-        input("Move the arm so the camera sees the whole board, then press Enter.")
-        arm.teaching_mode(False)
-    cal.q_view = arm.q
-    cam = RealSenseCamera()
-    color, _, _ = cam.read()
-    cal.image_corners = click_corners(color)
-    cal.save()
-    vision = BoardVision(cam, cal, args.detect)
-    obs = vision.observe()
-    cv2.imshow("Top-down board (any key to close)", obs.color)
-    cv2.waitKey(0)
-    cam.close()
+    return DryRunArm(cal.R_down) if args.dry_run else FrankyArm(cal.R_down)
 
 
 def cmd_view(args):
@@ -1376,7 +1333,6 @@ def cmd_play(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ip", default=ROBOT_IP, help="robot FCI address")
     p.add_argument("--dry-run", action="store_true", help="print arm commands instead of moving the robot")
     p.add_argument("--detect", choices=["color", "depth"], default=DETECTION_MODE)
     p.add_argument("--adjust", dest="adjust", action="store_true", default=ENABLE_PICK_ADJUSTMENT)
@@ -1389,8 +1345,6 @@ def main():
     p.add_argument("--no-calibrate", action="store_true", help="play: reuse the saved board position instead of finding it again")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("auto-calibrate", help="find the board by its yellow corners, then hover over a1/h1/h8 to check")
-    sub.add_parser("calibrate-board", help="teach a1, h1, h8 by hand-guiding the arm")
-    sub.add_parser("calibrate-camera", help="set the viewing pose and click the board corners")
     sub.add_parser("view", help="live detection overlay for tuning")
     t = sub.add_parser("pick-test", help="move one piece, e.g. pick-test e2 e4 --piece P")
     t.add_argument("src")
@@ -1400,8 +1354,6 @@ def main():
     args = p.parse_args()
     {
         "auto-calibrate": cmd_auto_calibrate,
-        "calibrate-board": cmd_calibrate_board,
-        "calibrate-camera": cmd_calibrate_camera,
         "view": cmd_view,
         "pick-test": cmd_pick_test,
         "play": cmd_play,
