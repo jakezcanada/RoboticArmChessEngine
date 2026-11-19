@@ -61,8 +61,8 @@ top-left h1, top-right a1. The playing area starts
 turns square to it, and goes to whatever height puts the 4 corners at the edges of the
 image (`VIEW_MARGIN`, 2%, in from them); there is no fixed camera height. It checks again from there and repeats until the view stops
 changing. You confirm the view (or search again); then it is saved as the viewing pose, and
-the arm hovers over a1, h1, h8 and a8 using the saved positions only.
-At each one you type how far off it is (`forward left` in cm, Enter = on target); the
+the arm hovers 10 cm above a1, h1, h8 and a8 (`AUTO_CAL_HOVER`) using the saved positions only.
+At each one you type how far off it is (`forward left [high]` in cm, Enter = on target); the
 average miss is taken off the board position and learned as a camera-mount correction
 (`mount_fix` in the calibration file, used by every later search), then it checks again.
 

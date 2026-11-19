@@ -128,7 +128,7 @@ VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far on
 #                          climb this much and keep shifting forward
 VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
 #  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
-AUTO_CAL_HOVER = 0.010  # check height: the fingertips stop this far above a1, h1 and h8
+AUTO_CAL_HOVER = 0.10  # check height: the fingertips stop this far above the board over the corner squares
 
 # --- COLOR detection: these are the variables to tune (HSV, OpenCV ranges H 0-180, S/V 0-255)
 #     Use `python chess_arm.py view` to see the result live.
@@ -1116,6 +1116,9 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     if plane is None or err > 0.03:
         print(f"  the 4 yellow corners don't form a square (off by {err:.0%})")
         return None
+    # The board lies flat on the table: keep only the height from the image (its tilt from one
+    # colour image is unreliable and can put a corner below the table) and make the plane level.
+    plane = (plane[0], cam_T[:3, :3].T @ np.array([0.0, 0.0, 1.0]))
     Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # board corners, base frame
     marks = on_plane(hull_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # marker outlines, base frame
     centre = Q.mean(0)
@@ -1341,23 +1344,26 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
         arm.open(0.0)
         corners = {"a1": cal.a1, "h1": cal.h1, "h8": cal.h8, "a8": cal.a1 + cal.h8 - cal.h1}
         misses = []
-        print("At each corner square, say how far the fingertips are from the square's centre, in cm:\n"
-              "  'forward left'  forward = away from the robot base, left = the robot's left (negative = back / right)\n"
-              "  e.g. '5 -2' = 5 cm too far forward and 2 cm too far right. Just Enter = on target.")
+        up = np.array([0.0, 0.0, 1.0])
+        print(f"At each corner square the fingertips stop {AUTO_CAL_HOVER * 100:.0f} cm above the board. Say how far off, in cm:\n"
+              "  'forward left [high]'  forward = away from the robot base, left = the robot's left (negative = back / right),\n"
+              f"  high (optional) = how much higher than {AUTO_CAL_HOVER * 100:.0f} cm above the board they are (negative = lower)\n"
+              "  e.g. '5 -2' = 5 cm too far forward and 2 cm too far right; '0 0 3' = right spot but 3 cm too high.\n"
+              "  Just Enter = on target.")
         for name, sq in corners.items():
-            arm.move_to(sq + board.ez * SAFE_HEIGHT)
-            arm.move_to(sq + board.ez * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
+            arm.move_to(sq + up * SAFE_HEIGHT)
+            arm.move_to(sq + up * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
             while True:
-                txt = input(f"  {name}: miss (forward left, cm) = ").strip().replace(",", " ")
+                txt = input(f"  {name}: miss (forward left [high], cm) = ").strip().replace(",", " ")
                 try:
                     vals = [float(v) for v in txt.split()] if txt else [0.0, 0.0]
-                    if len(vals) == 2:
+                    if len(vals) in (2, 3):
                         break
                 except ValueError:
                     pass
-                print("  type two numbers, e.g. '5 -2', or just Enter")
-            misses.append(np.array([vals[0], vals[1], 0.0]) / 100)
-            arm.move_to(sq + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
+                print("  type two or three numbers, e.g. '5 -2' or '5 -2 1', or just Enter")
+            misses.append(np.array([vals[0], vals[1], vals[2] if len(vals) == 3 else 0.0]) / 100)
+            arm.move_to(sq + up * SAFE_HEIGHT, speed=SPEED_APPROACH)
         misses = np.array(misses)
         m = misses.mean(0)
         if np.linalg.norm(m) < 0.003 and np.abs(misses).max() < 0.006:
@@ -1374,7 +1380,7 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
         cal.mount_fix = MOUNT_FIX.copy()
         cal.save()
         board = BoardFrame(cal)
-        print(f"Shifted the board {m[0] * 100:.1f} cm back, {m[1] * 100:.1f} cm right; camera mount now "
+        print(f"Shifted the board {m[0] * 100:.1f} cm back, {m[1] * 100:.1f} cm right, {m[2] * 100:.1f} cm down; camera mount now "
               f"{np.round(mount_offset(), 3)} m (CAMERA_MOUNT_OFFSET + learned fix). Checking again.")
     print(f"Square size {board.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, board.ez[2]))):.1f} deg.")
     if last is not None:
