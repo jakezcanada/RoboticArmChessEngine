@@ -113,7 +113,7 @@ BOARD_GUESS_CENTRE = (0.50, 0.0, 0.0)  # ESTIMATE: rough board centre in the rob
 CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in the gripper (EE) frame (m). MEASURE IT:
 #                                           an error here moves the whole board by the same amount.
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
-CORNER_HSV = ((15, 150, 120), (35, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
+CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
 BOARD_BORDER_FRACTION = 0.030  # border width / board width (outer edge to outer edge). Measured on a photo of
 #                                the lab board: 0.028-0.033. The playing area starts this far in from the corners.
@@ -1156,7 +1156,10 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
         except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
             print(f"  can't move there ({e}); keeping the current view")
             break
-        again = locate_board(arm, cam, robot_white)
+        for _try in range(3):  # give the camera a moment to settle (exposure, vibration) after the move
+            time.sleep(0.5)
+            if (again := locate_board(arm, cam, robot_white)) is not None:
+                break
         if again is None:
             print("  lost the corners after moving; going back to the last good view")
             arm.move_joints(q_before)
