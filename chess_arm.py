@@ -70,7 +70,7 @@ BOARD_WIDTH = 8 * SQUARE_SIZE + 2 * BOARD_BORDER  # 0.34 m, outer corner to oute
 
 # --- Pieces (ESTIMATES for a set that fits 1.5" squares, in metres) --------
 P, N, B, R, Q, K = chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
-PIECE_HEIGHT = {P: 0.030, N: 0.042, B: 0.045, R: 0.035, Q: 0.055, K: 0.065}
+PIECE_HEIGHT = {P: 0.030, N: 0.042, B: 0.055, R: 0.035, Q: 0.065, K: 0.075}  # B, Q, K measured; P, N, R estimates
 PIECE_BASE_DIAMETER = {P: 0.022, N: 0.025, B: 0.024, R: 0.024, Q: 0.027, K: 0.028}
 PIECE_GRIP_WIDTH = {P: 0.014, N: 0.016, B: 0.014, R: 0.018, Q: 0.016, K: 0.017}  # at grasp height
 GRASP_HEIGHT_FRACTION = 0.5  # grasp this far up the piece
@@ -83,7 +83,7 @@ GRIPPER_MAX_WIDTH = 0.08  # Franka Hand fully open
 OPEN_CLEARANCE = 0.020  # open this much wider than the piece base before descending
 
 # --- Motion ----------------------------------------------------------------
-SAFE_HEIGHT = 0.12  # travel height above the board (clears the king)
+SAFE_HEIGHT = 0.15  # travel height above the board: a carried king (held at half height) still clears a 7.5 cm king
 PLACE_EXTRA_HEIGHT = 0.003  # release this much higher than the grasp height
 # Speeds are Ruckig (velocity, acceleration, jerk) fractions of the Panda's Cartesian limits.
 # Any move that would then need a joint faster than the miniPC allows is slowed to just under it.
