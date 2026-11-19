@@ -93,7 +93,8 @@ HOME_SPEED_FACTOR = 0.2  # move_home() speed; the miniPC allows at most 0.3
 CONFIRM_ROBOT_MOTION = True  # ask "type [yes]" once before the robot first moves
 JOINT_VEL_LIMIT = 0.6525  # rad/s: the miniPC refuses a trajectory faster than this ("JointVelocityAboveMaximumAllowed")
 JOINT_ACC_LIMIT = 7.5  # rad/s^2: the miniPC's joint acceleration limit
-JOINT_VEL_MARGIN = 0.95  # a move over the limits is slowed to this fraction of them (just under)
+JOINT_VEL_TARGET = 0.6  # rad/s: a move that needs a faster joint is slowed to this
+JOINT_ACC_TARGET = 6.0  # rad/s^2: a move that needs a harder joint acceleration is slowed to this
 JOINT_STEP_MAX = 0.05  # rad between two trajectory points; more means IK jumped (e.g. flipped the wrist)
 
 # --- Capture area (in squares, measured from the centre of a1 along the board axes)
@@ -258,7 +259,7 @@ def loc_name(loc) -> str:
 
 def slow_down(q_traj: np.ndarray, dt: float) -> np.ndarray:
     """Stretch a joint trajectory in time (same dt, more points) so no joint goes faster than
-    JOINT_VEL_MARGIN * JOINT_VEL_LIMIT or accelerates harder than JOINT_VEL_MARGIN * JOINT_ACC_LIMIT.
+    JOINT_VEL_TARGET or accelerates harder than JOINT_ACC_TARGET (both under the miniPC's limits).
     A Cartesian path can need fast joints near awkward poses. Stretching k times divides
     velocities by k and accelerations by k^2 (a smooth spline keeps it that way)."""
     if len(q_traj) < 3:
@@ -268,7 +269,7 @@ def slow_down(q_traj: np.ndarray, dt: float) -> np.ndarray:
         raise RuntimeError(f"the joint path jumps {steps.max():.2f} rad in one step (IK flipped); not sending it")
     vel = steps.max() / dt
     acc = np.abs(np.diff(q_traj, 2, axis=0)).max() / dt**2
-    k = max(vel / (JOINT_VEL_MARGIN * JOINT_VEL_LIMIT), math.sqrt(acc / (JOINT_VEL_MARGIN * JOINT_ACC_LIMIT)))
+    k = max(vel / JOINT_VEL_TARGET, math.sqrt(acc / JOINT_ACC_TARGET))
     if k <= 1.0:
         return q_traj
     from scipy.interpolate import CubicSpline

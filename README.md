@@ -30,7 +30,7 @@ The program asks you to type `yes` once before the robot first moves
 (`CONFIRM_ROBOT_MOTION`). Speeds are `SPEED_TRAVEL` / `SPEED_APPROACH` (Ruckig fractions)
 and `HOME_SPEED_FACTOR` (at most 0.3).
 Any move that would need a joint faster than 0.6525 rad/s or 7.5 rad/s² is slowed to just
-under those limits (`JOINT_VEL_MARGIN` = 0.95), nothing more.
+under them: to 0.6 rad/s (`JOINT_VEL_TARGET`) and 6 rad/s² (`JOINT_ACC_TARGET`), nothing more.
 
 ## Setup (once per station)
 
