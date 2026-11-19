@@ -65,8 +65,6 @@ VERIFY_ROBOT_MOVES = True  # after the robot moves, check the board with the cam
 # --- Board (ESTIMATE; the real size is measured by calibrate-board) --------
 INCH = 0.0254
 SQUARE_SIZE = 1.5 * INCH  # only used to warn if the calibration looks wrong
-BOARD_BORDER = 0.4 * INCH  # ESTIMATE: border between the playing area and the board's edge (only a fallback;
-#                            auto-calibrate measures it)
 
 # --- Pieces (ESTIMATES for a set that fits 1.5" squares, in metres) --------
 P, N, B, R, Q, K = chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
@@ -82,9 +80,8 @@ OPEN_CLEARANCE = 0.020  # open this much wider than the piece base before descen
 
 # --- Motion ----------------------------------------------------------------
 SAFE_HEIGHT = 0.12  # travel height above the board (clears the king)
-VIEW_HEIGHT = 0.50  # gripper height above the board centre when the camera looks at it.
-#                    Higher = less "lean" of tall pieces near the edges, but the whole
-#                    board must stay in view (RealSense D435 vertical FOV is about 42 deg).
+VIEW_HEIGHT = 0.50  # gripper height above the board for the first look. auto-calibrate then picks the
+#                    viewing height itself, so that the 4 yellow corners just fit in the image.
 PLACE_EXTRA_HEIGHT = 0.003  # release this much higher than the grasp height
 SPEED_TRAVEL = 0.15  # panda-py speed_factor for moves at safe height
 SPEED_APPROACH = 0.06  # speed_factor for going down to / up from a piece
@@ -101,21 +98,23 @@ WARP_PX_PER_SQUARE = 80  # resolution of the top-down board image
 WARP_MARGIN = 0.5  # squares of border kept around the playing area (used to find the board plane)
 CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unavailable
 
-# --- Automatic board calibration (auto-calibrate) --------------------------
-#     The arm looks down, finds the yellow corner brackets, and takes the wood-coloured board
-#     between them. The board must be empty, or set up in the starting position (ranks 4 and 5 empty).
-#     Colours below were measured from a photo of the lab board. Hue ranges may wrap around
-#     180 (e.g. (170, ...) to (12, ...)) because reddish-brown sits at both ends of the hue scale.
+# --- Automatic board calibration (auto-calibrate, and the start of every `play`) --
+#     The arm looks down and finds the 4 yellow L-shaped corner brackets. The inside corner of
+#     each L is a corner of the board. The board's own colours are NOT used (they look too much
+#     like the table). The camera then moves straight above the board centre, turned square to
+#     it, at the height where all 4 corners fit in the image with VIEW_MARGIN to spare.
 BOARD_GUESS_CENTRE = (0.50, 0.0, 0.0)  # ESTIMATE: rough board centre in the robot base frame (m), where to look first
 CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in the gripper (EE) frame (m). MEASURE IT:
 #                                           an error here moves the whole board by the same amount.
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
-CORNER_HSV = ((15, 150, 120), (35, 255, 255))  # yellow corner brackets (measured: H 24-27, S 230-255, V 220-255)
-CORNER_MIN_COUNT = 3  # yellow corners that must be seen (of 4)
-BOARD_DARK_HSV = ((170, 80, 60), (12, 220, 215))  # dark squares and border (measured: H 7-8, S 118-140, V 125-160)
-BOARD_WOOD_MIN_SAT = 35  # any board wood (light squares: S ~60) is more saturated than the grey table (S < 30)
-BOARD_MIN_AREA = 0.05  # the board must fill at least this fraction of the camera image
-#  If the board isn't found, look at board_detect_debug.png: red = board wood, cyan = yellow corners.
+CORNER_HSV = ((15, 150, 120), (35, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
+CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
+BOARD_BORDER_FRACTION = 0.030  # border width / board width (outer edge to outer edge). Measured on a photo of
+#                                the lab board: 0.028-0.033. The playing area starts this far in from the corners.
+VIEW_MARGIN = 0.08  # free space left around the 4 corners, as a fraction of the image width/height on each side
+VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT = 0.25, 0.85  # allowed camera heights above the board (m)
+VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
+#  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
 AUTO_CAL_HOVER = 0.010  # check height: the fingertips stop this far above a1, h1 and h8
 
 # --- COLOR detection: these are the variables to tune (HSV, OpenCV ranges H 0-180, S/V 0-255)
@@ -946,151 +945,82 @@ def project(points_base, cam_T, intrinsics):
     return np.column_stack([fx * p[:, 0] / p[:, 2] + cx, fy * p[:, 1] / p[:, 2] + cy])
 
 
-def dark_mask(color):
-    """Pixels the colour of the border / dark squares."""
+def corner_mask(color):
+    """Pixels the colour of the yellow brackets (small specks removed, screw holes filled)."""
     import cv2
 
-    return hsv_mask(cv2.cvtColor(color, cv2.COLOR_BGR2HSV), BOARD_DARK_HSV)
+    m = hsv_mask(cv2.cvtColor(color, cv2.COLOR_BGR2HSV), CORNER_HSV).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)) > 0
 
 
-def board_masks(color):
-    """(yellow corner pixels, board wood pixels)."""
+def bracket_corners(mask) -> list[np.ndarray]:
+    """Inside corner (pixel) of each L-shaped yellow bracket, biggest bracket first.
+
+    The inside corner of an L is the point of the shape deepest inside its convex hull
+    (the deepest "convexity defect"), which is where the board's corner sits."""
     import cv2
 
-    hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
-    k5 = np.ones((5, 5), np.uint8)
-    yellow = cv2.morphologyEx(hsv_mask(hsv, CORNER_HSV).astype(np.uint8), cv2.MORPH_OPEN, k5)
-    near_yellow = cv2.dilate(yellow, k5, iterations=2) > 0
-    hue = hsv[..., 0]
-    wood = (hsv[..., 1] >= BOARD_WOOD_MIN_SAT) & ((hue <= 25) | (hue >= 165)) & ~near_yellow
-    wood = cv2.morphologyEx(wood.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    wood = cv2.morphologyEx(wood, cv2.MORPH_OPEN, k5)
-    return yellow > 0, wood > 0
-
-
-def refine_quad(pts, quad, side):
-    """Sharper corners: fit a line to the outline points along each side, then intersect the lines."""
-    lines = []
-    for i in range(4):
-        p, q = quad[i], quad[(i + 1) % 4]
-        d = (q - p) / np.linalg.norm(q - p)
-        rel = pts - p
-        along = rel @ d
-        off = np.abs(rel @ np.array([-d[1], d[0]]))
-        L = np.linalg.norm(q - p)
-        sel = pts[(off < 0.03 * side) & (along > 0.15 * L) & (along < 0.85 * L)]  # middle of the side only
-        if len(sel) < 10:
-            return quad
-        c = sel.mean(0)
-        direction = np.linalg.svd(sel - c)[2][0]
-        lines.append((c, direction))
+    contours = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
     out = []
-    for i in range(4):  # corner i joins side i-1 and side i
-        (c1, d1), (c2, d2) = lines[i - 1], lines[i]
-        A = np.column_stack([d1, -d2])
-        if abs(np.linalg.det(A)) < 1e-6:
-            return quad
-        t = np.linalg.solve(A, c2 - c1)
-        out.append(c1 + t[0] * d1)
-    out = np.array(out)
-    return out if np.max(np.linalg.norm(out - quad, axis=1)) < 0.05 * side else quad
-
-
-def find_board_outline(yellow, wood):
-    """Outer corners (4 x 2 pixels) of the wood region framed by the yellow corners, or (None, reason)."""
-    import cv2
-
-    img_area = yellow.size
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(yellow.astype(np.uint8))
-    corners = [cents[i] for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 0.0003 * img_area]
-    if len(corners) < CORNER_MIN_COUNT:
-        return None, f"only {len(corners)} yellow corner(s) seen (need {CORNER_MIN_COUNT})"
-    # the board is the big wood region that touches the yellow corners
-    touch = cv2.dilate(yellow.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=4) > 0
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(wood.astype(np.uint8))
-    best, best_touch = 0, 0
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] < BOARD_MIN_AREA * img_area:
-            continue
-        t = np.count_nonzero(touch & (labels == i))
-        if t > best_touch:
-            best, best_touch = i, t
-    if not best:
-        return None, "no large wood-coloured area next to the yellow corners"
-    contour = cv2.findContours((labels == best).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0]
-    hull = cv2.convexHull(contour)
-    quad = None
-    for eps in np.linspace(0.01, 0.08, 15):
-        approx = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
-        if len(approx) == 4:
-            quad = approx.reshape(4, 2).astype(float)
+    for c in sorted(contours, key=cv2.contourArea, reverse=True):
+        if cv2.contourArea(c) < CORNER_MIN_AREA * mask.size:
             break
-    if quad is None:
-        return None, "the board outline isn't four-sided"
-    side = np.mean([np.linalg.norm(quad[(i + 1) % 4] - quad[i]) for i in range(4)])
-    quad = refine_quad(contour.reshape(-1, 2).astype(float), quad, side)
-    at_corner = sum(np.min(np.linalg.norm(quad - c, axis=1)) < 0.15 * side for c in corners)
-    if at_corner < CORNER_MIN_COUNT:
-        return None, f"only {at_corner} yellow corner(s) are at a corner of the wood area"
-    return quad, None
-
-
-def border_fraction(color, H, n_px=800):
-    """Border width as a fraction of the board's outer size.
-
-    The board is warped top-down (a-file left, rank 8 top). Ranks 4 and 5 are empty in the
-    starting position; along them the outermost light squares (a4 on the left, h5 on the
-    right) start exactly where the playing area starts."""
-    import cv2
-
-    top = cv2.warpPerspective(color, H, (n_px, n_px))
-    # light = not dark wood; opening with a wide kernel drops thin lines (inlay, fold seam, table edge)
-    light = cv2.morphologyEx((~dark_mask(top)).astype(np.uint8), cv2.MORPH_OPEN, np.ones((1, n_px // 40), np.uint8)) > 0
-    band = slice(int(n_px * 0.42), int(n_px * 0.58))  # rows across ranks 4 and 5 (border up to ~1.5 squares)
-    lefts, rights = [], []
-    for row in light[band]:
-        cols = np.nonzero(row)[0]
-        if len(cols):
-            lefts.append(cols.min())
-            rights.append(cols.max())
-    if len(lefts) < 10:
-        return None
-    left = np.percentile(lefts, 20) / n_px  # rank-4 rows start with a light square (a4)
-    right = 1 - np.percentile(rights, 80) / n_px  # rank-5 rows end with a light square (h5)
-    if abs(left - right) > 0.03 or not 0 <= left < 0.25:
-        return None
-    return (left + right) / 2
+        hull = np.sort(cv2.convexHull(c, returnPoints=False), axis=0)
+        try:
+            defects = cv2.convexityDefects(c, hull)
+        except cv2.error:
+            continue
+        if defects is None or len(defects) == 0:
+            continue
+        defects = defects.reshape(-1, 4)  # rows: start, end, farthest point, depth * 256
+        start, end, far, depth = defects[np.argmax(defects[:, 3])]
+        if depth / 256 < 3:  # not an L (no real notch)
+            continue
+        out.append(c[far, 0].astype(float))
+    return out
 
 
 def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
-    """Look for the board from where the arm is now. Returns (a1, h1, h8, (ex, ey, n, square)) or None."""
+    """Find the board from where the arm is now, using only the 4 yellow corners.
+
+    Returns a dict (a1, h1, h8, axes = (ex, ey, n, square), outer = board corners a1/h1/h8/a8
+    side in the base frame, outer_px / image_corners = pixels of the board / playing-area
+    corners) or None."""
     import cv2
 
     color, depth, _ = cam.read()
-    yellow, wood = board_masks(color)
-    quad, why = find_board_outline(yellow, wood)
+    mask = corner_mask(color)
+    pts = bracket_corners(mask)
     debug = color.copy()
-    debug[wood] = (debug[wood] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
-    debug[yellow] = (255, 255, 0)
+    debug[mask] = (255, 255, 0)
+    for pt in pts:
+        cv2.circle(debug, tuple(int(x) for x in pt), 8, (0, 0, 255), 2)
     debug_path = Path(__file__).with_name("board_detect_debug.png")
-    if quad is None:
-        cv2.imwrite(str(debug_path), debug)
-        print(f"  board not found: {why} (see {debug_path.name}: red = wood, cyan = yellow)")
+    cv2.imwrite(str(debug_path), debug)
+    if len(pts) < 4:
+        print(f"  only {len(pts)} of the 4 yellow corners seen (see {debug_path.name}; cyan = yellow)")
         return None
-    mask = wood
+    pts = np.array(pts[:4])
     h_img, w_img = mask.shape
-    if quad[:, 0].min() < 3 or quad[:, 1].min() < 3 or quad[:, 0].max() > w_img - 4 or quad[:, 1].max() > h_img - 4:
-        cv2.imwrite(str(debug_path), debug)
-        print(f"  the board runs off the edge of the camera image; raise VIEW_HEIGHT or move the camera ({debug_path.name})")
+    if pts[:, 0].min() < 3 or pts[:, 1].min() < 3 or pts[:, 0].max() > w_img - 4 or pts[:, 1].max() > h_img - 4:
+        print("  a corner is at the edge of the image")
         return None
+    c = pts.mean(0)
+    quad = pts[np.argsort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))]  # in order around the board
     inside = np.zeros(mask.shape, np.uint8)
     cv2.fillConvexPoly(inside, quad.astype(np.int32), 1)
-    plane = fit_plane(depth, mask & (inside > 0), cam.intrinsics)
+    plane = fit_plane(depth, (inside > 0) & ~mask, cam.intrinsics)  # RANSAC: pieces don't matter
     if plane is None:
-        print("  board found, but not enough depth readings on it")
+        print("  corners found, but not enough depth readings on the board")
         return None
     cam_T = camera_pose(arm.pose)
-    Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # outer corners, base frame
+    Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # board corners, base frame
+    sides = [np.linalg.norm(Q[(i + 1) % 4] - Q[i]) for i in range(4)]
+    diags = [np.linalg.norm(Q[2] - Q[0]), np.linalg.norm(Q[3] - Q[1])]
+    if max(sides) / min(sides) > 1.15 or max(diags) / min(diags) > 1.1:
+        print(f"  the 4 yellow corners don't form a square (sides {np.round(np.array(sides) * 1000)} mm)")
+        return None
     centre = Q.mean(0)
     n = np.cross(Q[1] - Q[0], Q[2] - Q[1])
     n /= np.linalg.norm(n)
@@ -1107,26 +1037,49 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
     rel = Q - centre
     order = [np.argmin(rel @ (ex + ey)), np.argmax(rel @ (ex - ey)), np.argmax(rel @ (ex + ey)), np.argmax(rel @ (ey - ex))]
     if len(set(order)) < 4:
-        print("  board outline isn't a clean square")
+        print("  couldn't tell which corner is which")
         return None
-    px = quad[order]  # image corners: a1, h1, h8, a8 (outer edge of the border)
-    H = cv2.getPerspectiveTransform(np.float32(px), np.float32([[0, 800], [800, 800], [800, 0], [0, 0]]))
-    b = border_fraction(color, H)
-    if b is None:
-        b = BOARD_BORDER / (8 * SQUARE_SIZE + 2 * BOARD_BORDER)
-        print(f"  couldn't measure the border from the light squares; using BOARD_BORDER ({b:.3f} of the board)")
-    inner_warp = np.float32([[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]) * 800
-    inner_px = cv2.perspectiveTransform(inner_warp[None], np.linalg.inv(H))[0]
-    C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # playing-area corners
+    outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
+    # playing area: BOARD_BORDER_FRACTION in from the board's edges
+    b = BOARD_BORDER_FRACTION
+    H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
+    inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
+    C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]
     sq = np.mean([np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]) / 8
     a1 = C[0] + sq / 2 * (ex + ey)
     cv2.polylines(debug, [inner_px.astype(np.int32)], True, (0, 255, 0), 2)
     for name, pt in zip(("a1", "h1", "h8", "a8"), inner_px):
         cv2.putText(debug, name, tuple(int(x) for x in pt), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.imwrite(str(debug_path), debug)
-    print(f"  board found: square {sq * 1000:.1f} mm, border {b * (8 * sq) / (1 - 2 * b) * 1000:.0f} mm, "
-          f"centre {np.round(centre, 3)}")
-    return a1, a1 + 7 * sq * ex, a1 + 7 * sq * (ex + ey), (ex, ey, n, sq)
+    print(f"  4 corners found: square {sq * 1000:.1f} mm, board centre {np.round(centre, 3)}")
+    return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
+            "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float)}
+
+
+def view_pose_for(found, intrinsics, R_down):
+    """Gripper (position, yaw) that puts the camera straight above the board centre, turned square
+    to the board, at the height where the 4 corners fill the image with VIEW_MARGIN to spare."""
+    fx, fy, cx, cy = intrinsics
+    ex, ey, n, _ = found["axes"]
+    Q = found["outer"]
+    centre = Q.mean(0)
+    R_mount = rot_z(math.radians(CAMERA_MOUNT_YAW_DEG))
+    cam_x0 = (R_down @ R_mount)[:, 0]
+    # smallest turn that lines the image x-axis up with a board edge
+    turn = math.atan2(ex[1], ex[0]) - math.atan2(cam_x0[1], cam_x0[0])
+    yaw = (turn + math.pi / 4) % (math.pi / 2) - math.pi / 4
+    R_cam = rot_z(yaw) @ R_down @ R_mount
+    half_x = np.abs((Q - centre) @ R_cam[:, 0]).max()
+    half_y = np.abs((Q - centre) @ R_cam[:, 1]).max()
+    room_x = min(cx, CAMERA_WIDTH - cx) - VIEW_MARGIN * CAMERA_WIDTH  # pixels from the image centre to the margin
+    room_y = min(cy, CAMERA_HEIGHT - cy) - VIEW_MARGIN * CAMERA_HEIGHT
+    h = max(fx * half_x / room_x, fy * half_y / room_y)
+    if h > VIEW_MAX_HEIGHT:
+        print(f"  the board needs {h:.2f} m of height to fit; using VIEW_MAX_HEIGHT ({VIEW_MAX_HEIGHT} m)")
+    h = float(np.clip(h, VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT))
+    cam_pos = centre + n * h
+    R_ee = rot_z(yaw) @ R_down
+    return cam_pos - R_ee @ np.asarray(CAMERA_MOUNT_OFFSET), yaw, h
 
 
 def teach_points(arm, cal: Calibration, names=("a1", "h1", "h8")):
@@ -1147,7 +1100,7 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
 
     ``check``: afterwards hover over a1, h1, h8 and ask whether that looks right."""
     robot_white = args.robot_color == "white"
-    print("Finding the board (it must be empty or in the starting position).")
+    print("Finding the board by its 4 yellow corners.")
     # look first where the board was last time, else at BOARD_GUESS_CENTRE
     last = BoardFrame(cal).centre() if cal.a1 is not None else None
     look_at = last if last is not None else np.array(BOARD_GUESS_CENTRE, float)
@@ -1155,34 +1108,42 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
     cal.R_down = arm.pose[:3, :3]
     arm.R_down = cal.R_down
     found = None
-    for extra in (0.0, 0.15, 0.30):  # go higher if the board doesn't fit in the image
-        print(f"Looking for the board from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
+    for extra in (0.0, 0.15, 0.30):  # go higher if the 4 corners don't fit in the image
+        print(f"Looking for the 4 yellow corners from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
         arm.move_to(look_at + [0, 0, VIEW_HEIGHT + extra])
         if (found := locate_board(arm, cam, robot_white)) is not None:
             break
     while found is None:
-        if input("Board not found. Hand-guide the camera over the board and try again? [Y/n] ").strip().lower() == "n":
-            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE, CORNER_HSV and BOARD_DARK_HSV "
+        if input("Corners not found. Hand-guide the camera over the board and try again? [Y/n] ").strip().lower() == "n":
+            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE and CORNER_HSV "
                      "(see board_detect_debug.png), or use calibrate-board / calibrate-camera.")
         arm.teaching_mode(True)
-        input("Move the arm so the camera sees the whole board from above, then press Enter.")
+        input("Move the arm so the camera sees all 4 yellow corners from above, then press Enter.")
         arm.teaching_mode(False)
         found = locate_board(arm, cam, robot_white)
-    view_h = max(VIEW_HEIGHT, float((arm.pose[:3, 3] - found[0]) @ found[3][2]))  # the height that worked
 
-    # second look, straight above the board centre: a better estimate, and the viewing pose
-    cal.a1, cal.h1, cal.h8 = found[:3]
-    arm.move_to(BoardFrame(cal).centre(view_h))
-    print("Looking again from above the board centre.")
-    found = locate_board(arm, cam, robot_white) or found
-    cal.a1, cal.h1, cal.h8 = found[:3]
-    ex, ey, _, s = found[3]
-    board = BoardFrame(cal)
-    arm.move_to(board.centre(view_h))
+    # adjust the camera until the 4 corners fit the image: centred, square to it, right height
+    for _ in range(4):
+        target, yaw, h = view_pose_for(found, cam.intrinsics, cal.R_down)
+        step = float(np.linalg.norm(target - arm.pose[:3, 3]))
+        if step < VIEW_FIT_TOLERANCE:
+            break
+        print(f"Adjusting the view: camera {h:.2f} m above the board, turned {math.degrees(yaw):.0f} deg.")
+        q_before = arm.q
+        arm.move_to(target, yaw)
+        again = locate_board(arm, cam, robot_white)
+        if again is None:
+            print("  lost the corners after moving; going back to the last good view")
+            arm.move_joints(q_before)
+            break
+        found = again
+    cal.a1, cal.h1, cal.h8 = found["a1"], found["h1"], found["h8"]
     cal.q_view = arm.q
-    a8 = cal.a1 + 7 * s * ey
-    outer = [cal.a1 - s / 2 * (ex + ey), cal.h1 + s / 2 * (ex - ey), cal.h8 + s / 2 * (ex + ey), a8 + s / 2 * (ey - ex)]
-    cal.image_corners = project(outer, camera_pose(arm.pose), cam.intrinsics)
+    cal.image_corners = found["image_corners"]
+    board = BoardFrame(cal)
+    px = found["outer_px"]
+    print(f"View set: the corners span x {px[:, 0].min():.0f}-{px[:, 0].max():.0f}, "
+          f"y {px[:, 1].min():.0f}-{px[:, 1].max():.0f} of the {CAMERA_WIDTH}x{CAMERA_HEIGHT} image.")
 
     if check:  # hover just above a1, h1, h8
         arm.open(0.0)

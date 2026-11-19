@@ -39,28 +39,29 @@ between games. It looks first where the board was last time. `--no-calibrate` sk
 this and reuses the saved position. Calibration is saved to `chess_calibration.json`
 next to the script.
 
-**How the board is found:** the board has yellow corner brackets (at least 3 of the 4
-must be visible). The program finds them, then takes the wood-coloured region between
-them as the board. The grey breadboard is much less saturated than the wood, so it and
-its holes are ignored. The board's outline gives its outer corners. On ranks 4 and 5,
-which are empty in the starting position, the outermost light squares show where the
-thin border ends. Depth gives the board's height and tilt, and which side the robot sits
-on (`--robot-color`) decides which corner is a1. The board can be empty or set up. If the
-board doesn't fit in the camera image, the arm moves higher and tries again.
+**How the board is found:** only the 4 yellow L-shaped corner brackets are used. The
+board's own colours are not, because they look too much like the table. The inside corner
+of each L is a corner of the board. All 4 must be visible. If they aren't, the arm moves
+higher and tries again. Depth gives the board's height and tilt, and which side the robot
+sits on (`--robot-color`) decides which corner is a1. The playing area starts
+`BOARD_BORDER_FRACTION` (3% of the board width, measured from a photo) in from the corners.
 
-Colours are set for the lab board and pieces, measured from a photo (H 0-180, S/V 0-255):
+**The camera then fits itself to the board:** it moves straight above the board's centre,
+turns square to it, and goes to the height where all 4 corners fit in the image with
+`VIEW_MARGIN` to spare. It checks again from there and repeats until the view stops
+changing. That pose becomes the viewing pose for the game.
+
+Colours (H 0-180, S/V 0-255), measured from a photo of the lab board and pieces:
 
 | | Setting | Measured |
 |---|---|---|
 | Yellow corners | `CORNER_HSV` | H 24-27, S 230-255, V 220-255 |
-| Dark squares + border | `BOARD_DARK_HSV` | H 7-8, S 118-140, V 125-160 |
-| Light squares | (anything not dark) | H 13-15, S ~60, V ~210 |
 | Light pieces | `WHITE_PIECE_HSV` | H 18-20, S 75-110, V 200-240 |
 | Dark pieces | `BLACK_PIECE_HSV` | H 0-11, S 110-230, V 25-120 |
 
 The RealSense sees colours a bit differently from a phone, so check them with `view`.
-If the board isn't found, open `board_detect_debug.png` (red = board wood, cyan =
-yellow corners). Brown hue wraps around 180, so a range like `(170, ...)` to `(12, ...)`
+If the corners aren't found, open `board_detect_debug.png` (cyan = what was taken as
+yellow, red circles = the inside corners found). Brown hue wraps around 180, so a range like `(170, ...)` to `(12, ...)`
 means 170-180 and 0-12.
 
 Set before the first run:
