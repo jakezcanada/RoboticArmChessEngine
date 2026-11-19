@@ -33,7 +33,7 @@ and `HOME_SPEED_FACTOR` (at most 0.3).
 ## Setup (once per station)
 
 ```bash
-python chess_arm.py auto-calibrate     # find the board, then hover over a1/h1/h8 so you can check it
+python chess_arm.py auto-calibrate     # find the board, confirm the view, then hover over the 4 corner squares
 python chess_arm.py view               # live overlay: tune colours / depth until all squares are green
 python chess_arm.py pick-test e2 e4    # move one piece to check the grasp
 ```
@@ -45,15 +45,17 @@ next to the script.
 
 **How the board is found:** only the 4 yellow L-shaped corner brackets are used. The
 board's own colours are not, because they look too much like the table. The inside corner
-of each L is a corner of the board. All 4 must be visible. If they aren't, the arm moves
-higher and tries again. Depth gives the board's height and tilt, and which side the robot
+of each L is a corner of the board. From home, the bottom-left and bottom-right corners
+must be in view; the camera shifts forward (`VIEW_FORWARD_STEP`) until all 4 are in the
+image, climbing if the near ones drop out before the far ones appear. Depth gives the board's height and tilt, and which side the robot
 sits on (`--robot-color`) decides which corner is a1. The playing area starts
 `BOARD_BORDER_FRACTION` (3% of the board width, measured from a photo) in from the corners.
 
 **The camera then fits itself to the board:** it moves straight above the board's centre,
-turns square to it, and goes to the height where all 4 corners fit in the image with
-`VIEW_MARGIN` to spare. It checks again from there and repeats until the view stops
-changing. That pose becomes the viewing pose for the game.
+turns square to it, and goes to whatever height puts the 4 corners at the edges of the
+image (`VIEW_MARGIN`, 2%, in from them); there is no fixed camera height. It checks again from there and repeats until the view stops
+changing. You confirm the view (or search again); then it is saved as the viewing pose, and
+the arm hovers over a1, h1, h8 and a8 using the saved positions only.
 
 Colours (H 0-180, S/V 0-255), measured from a photo of the lab board and pieces:
 
@@ -71,7 +73,8 @@ means 170-180 and 0-12.
 Set before the first run:
 * `CAMERA_MOUNT_OFFSET`, `CAMERA_MOUNT_YAW_DEG`: where the camera sits on the gripper.
   Any error here shifts the whole board by the same amount.
-* `BOARD_GUESS_CENTRE`: roughly where the board is, for the very first search.
+* `VIEW_FORWARD`: which way is forward (robot towards board). From home, the bottom-left and
+  bottom-right yellow corners must be in view; the camera shifts forward from there.
 
 Hand-guiding isn't available through the course server, so there is no manual calibration.
 
@@ -135,5 +138,4 @@ camera uses to watch the board:
   `GRASP_HEIGHT_FRACTION` of the piece height)
 * `SQUARE_SIZE` (only used to warn if calibration looks wrong)
 * `CAPTURE_FIRST_SLOT`: must be reachable and clear of the board
-* `VIEW_HEIGHT`: the whole playing area must be in the camera image
 * Colour ranges / depth thresholds, using `view`

@@ -82,8 +82,6 @@ OPEN_CLEARANCE = 0.020  # open this much wider than the piece base before descen
 
 # --- Motion ----------------------------------------------------------------
 SAFE_HEIGHT = 0.12  # travel height above the board (clears the king)
-VIEW_HEIGHT = 0.50  # gripper height above the board for the first look. auto-calibrate then picks the
-#                    viewing height itself, so that the 4 yellow corners just fit in the image.
 PLACE_EXTRA_HEIGHT = 0.003  # release this much higher than the grasp height
 # Speeds are Ruckig (velocity, acceleration, jerk) fractions of the Panda's limits, as in the
 # csc376_franky examples (they use 0.02, 0.01, 0.05). Start slow; raise only after testing.
@@ -108,8 +106,10 @@ CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unava
 #     The arm looks down and finds the 4 yellow L-shaped corner brackets. The inside corner of
 #     each L is a corner of the board. The board's own colours are NOT used (they look too much
 #     like the table). The camera then moves straight above the board centre, turned square to
-#     it, at the height where all 4 corners fit in the image with VIEW_MARGIN to spare.
-BOARD_GUESS_CENTRE = (0.50, 0.0, 0.0)  # ESTIMATE: rough board centre in the robot base frame (m), where to look first
+#     it, at whatever height puts the 4 corners at the edges of the image (VIEW_MARGIN in from them).
+VIEW_FORWARD = (1.0, 0.0)  # "forward" in the robot base frame (x, y): from the robot towards the board
+VIEW_FORWARD_STEP = 0.04  # from home, the camera shifts forward this much at a time until all 4 corners are seen (m)
+VIEW_FORWARD_MAX = 0.40  # give up (and ask) after shifting this far forward (m)
 CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in the gripper (EE) frame (m). MEASURE IT:
 #                                           an error here moves the whole board by the same amount.
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
@@ -117,10 +117,9 @@ CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured 
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
 BOARD_BORDER_FRACTION = 0.030  # border width / board width (outer edge to outer edge). Measured on a photo of
 #                                the lab board: 0.028-0.033. The playing area starts this far in from the corners.
-VIEW_MARGIN = 0.08  # free space left around the 4 corners, as a fraction of the image width/height on each side
-VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT = 0.25, 0.68  # allowed camera heights above the board (m); the Panda
-#                                               can't reach much higher with the gripper pointing down
-VIEW_SEARCH_EXTRA = (0.0, 0.07, 0.14)  # if the corners aren't all seen, look again this much higher
+VIEW_MARGIN = 0.02  # the outer board corners end up this fraction of the image width/height in from its edges
+VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
+#                          climb this much and keep shifting forward
 VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
 #  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
 AUTO_CAL_HOVER = 0.010  # check height: the fingertips stop this far above a1, h1 and h8
@@ -774,7 +773,7 @@ class ChessMover:
         if self.cal.q_view is not None:
             self.arm.move_joints(self.cal.q_view)
         else:
-            self.arm.move_to(self.board.centre(VIEW_HEIGHT))
+            sys.exit("No viewing pose saved; run auto-calibrate first.")
 
     @staticmethod
     def grasp_height(piece: chess.Piece) -> float:
@@ -1018,7 +1017,7 @@ def bracket_corners(mask) -> list[np.ndarray]:
 def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
     """Find the board from where the arm is now, using only the 4 yellow corners.
 
-    Returns a dict (a1, h1, h8, axes = (ex, ey, n, square), outer = board corners a1/h1/h8/a8
+    Sets ``locate_board.seen`` to how many yellow corners were in the image. Returns a dict (a1, h1, h8, axes = (ex, ey, n, square), outer = board corners a1/h1/h8/a8
     side in the base frame, outer_px / image_corners = pixels of the board / playing-area
     corners) or None."""
     import cv2
@@ -1026,6 +1025,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool):
     color, depth, _ = cam.read()
     mask = corner_mask(color)
     pts = bracket_corners(mask)
+    locate_board.seen = len(pts)
     debug = color.copy()
     debug[mask] = (255, 255, 0)
     for pt in pts:
@@ -1107,89 +1107,121 @@ def view_pose_for(found, intrinsics, R_down):
     half_y = np.abs((Q - centre) @ R_cam[:, 1]).max()
     room_x = min(cx, CAMERA_WIDTH - cx) - VIEW_MARGIN * CAMERA_WIDTH  # pixels from the image centre to the margin
     room_y = min(cy, CAMERA_HEIGHT - cy) - VIEW_MARGIN * CAMERA_HEIGHT
-    h = max(fx * half_x / room_x, fy * half_y / room_y)
-    if h > VIEW_MAX_HEIGHT:
-        print(f"  the board needs {h:.2f} m of height to fit; using VIEW_MAX_HEIGHT ({VIEW_MAX_HEIGHT} m)")
-    h = float(np.clip(h, VIEW_MIN_HEIGHT, VIEW_MAX_HEIGHT))
+    h = float(max(fx * half_x / room_x, fy * half_y / room_y))  # no fixed height: whatever makes the board fill the image
     cam_pos = centre + n * h
     R_ee = rot_z(yaw) @ R_down
     return cam_pos - R_ee @ np.asarray(CAMERA_MOUNT_OFFSET), yaw, h
 
 
+def search_board(arm, cam: RealSenseCamera, robot_white: bool):
+    """From home (bottom-left and bottom-right corners in view), shift the camera forward until
+    all 4 yellow corners are in the image. Climbs if the board doesn't fit. Returns locate_board's dict or None."""
+    start = arm.pose[:3, 3].copy()
+    fwd = np.array([*VIEW_FORWARD, 0.0], float)
+    fwd /= np.linalg.norm(fwd)
+    if (found := locate_board(arm, cam, robot_white)) is not None:
+        return found
+    if locate_board.seen < 2:
+        print("  WARNING: the bottom-left and bottom-right yellow corners should be in view from home.")
+    shift, up, seen_two = 0.0, 0.0, locate_board.seen >= 2
+    while shift < VIEW_FORWARD_MAX:
+        if seen_two and locate_board.seen < 2:  # near corners left the image before the far ones came in
+            up += VIEW_SEARCH_STEP
+            seen_two = False
+            print(f"  the board doesn't fit at this height; going {VIEW_SEARCH_STEP * 100:.0f} cm higher")
+        else:
+            shift += VIEW_FORWARD_STEP
+        print(f"Shifting the camera forward: {shift * 100:.0f} cm from home, {up * 100:.0f} cm up.")
+        try:
+            arm.move_to(start + fwd * shift + [0, 0, up])
+        except Exception as e:  # noqa: BLE001 - out of reach
+            print(f"  can't move there ({e})")
+            return None
+        if (found := locate_board(arm, cam, robot_white)) is not None:
+            return found
+        seen_two = seen_two or locate_board.seen >= 2
+    return None
+
+
 def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: bool = True):
     """Find the board with the camera and fill in a1, h1, h8, R_down, q_view and image_corners.
 
-    ``check``: afterwards hover over a1, h1, h8 and ask whether that looks right."""
+    1. From home, shift forward until all 4 yellow corners are in the image.
+    2. Zoom: move square above the board at the height where the corners reach the image edges.
+    3. The user confirms that view; it is saved.
+    4. ``check``: hover over the 4 corner squares (no camera) and ask whether that looks right."""
     robot_white = args.robot_color == "white"
     print("Finding the board by its 4 yellow corners.")
-    # look first where the board was last time, else at BOARD_GUESS_CENTRE
     last = BoardFrame(cal).centre() if cal.a1 is not None else None
-    look_at = last if last is not None else np.array(BOARD_GUESS_CENTRE, float)
-    arm.home()
-    cal.R_down = arm.pose[:3, :3]
-    arm.R_down = cal.R_down
-    found = None
-    while found is None:
-        for extra in VIEW_SEARCH_EXTRA:  # go higher if the 4 corners don't fit in the image
-            print(f"Looking for the 4 yellow corners from {VIEW_HEIGHT + extra:.2f} m above {np.round(look_at, 2)}.")
-            try:
-                arm.move_to(look_at + [0, 0, VIEW_HEIGHT + extra])
-            except Exception as e:  # noqa: BLE001 - e.g. out of reach: try the next height
-                print(f"  can't move there ({e})")
-                continue
-            if (found := locate_board(arm, cam, robot_white)) is not None:
-                break
-        if found is None and input("Corners not found. Make sure all 4 yellow corners are uncovered and the board "
-                                   "is near BOARD_GUESS_CENTRE, then press Enter to look again (q = quit) ").strip() == "q":
-            sys.exit("Auto-calibration failed. Check BOARD_GUESS_CENTRE and CORNER_HSV (see board_detect_debug.png).")
+    while True:
+        arm.home()
+        cal.R_down = arm.pose[:3, :3]
+        arm.R_down = cal.R_down
+        found = search_board(arm, cam, robot_white)
+        if found is None:
+            if input("Corners not found. Put the board so its bottom-left and bottom-right yellow corners are in view "
+                     "from home, then press Enter to try again (q = quit) ").strip() == "q":
+                sys.exit("Auto-calibration failed. Check the board position and CORNER_HSV (see board_detect_debug.png).")
+            continue
 
-    # adjust the camera until the 4 corners fit the image: centred, square to it, right height
-    for _ in range(4):
-        target, yaw, h = view_pose_for(found, cam.intrinsics, cal.R_down)
-        step = float(np.linalg.norm(target - arm.pose[:3, 3]))
-        if step < VIEW_FIT_TOLERANCE:
-            break
-        print(f"Adjusting the view: camera {h:.2f} m above the board, turned {math.degrees(yaw):.0f} deg.")
-        q_before = arm.q
-        try:
-            arm.move_to(target, yaw)
-        except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
-            print(f"  can't move there ({e}); keeping the current view")
-            break
-        for _try in range(3):  # give the camera a moment to settle (exposure, vibration) after the move
-            time.sleep(0.5)
-            if (again := locate_board(arm, cam, robot_white)) is not None:
+        # zoom: centred, square to the image, corners at the image edges
+        for _ in range(4):
+            target, yaw, h = view_pose_for(found, cam.intrinsics, cal.R_down)
+            if float(np.linalg.norm(target - arm.pose[:3, 3])) < VIEW_FIT_TOLERANCE:
                 break
-        if again is None:
-            print("  lost the corners after moving; going back to the last good view")
-            arm.move_joints(q_before)
+            print(f"Zooming to the board: camera {h:.2f} m above it, turned {math.degrees(yaw):.0f} deg.")
+            q_before = arm.q
+            try:
+                arm.move_to(target, yaw)
+            except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
+                print(f"  can't move there ({e}); keeping the current view")
+                break
+            again = None
+            for _try in range(3):  # give the camera a moment to settle (exposure, vibration) after the move
+                time.sleep(0.5)
+                if (again := locate_board(arm, cam, robot_white)) is not None:
+                    break
+            if again is None:
+                print("  lost the corners after moving; going back to the last good view")
+                arm.move_joints(q_before)
+                break
+            found = again
+
+        px = found["outer_px"]
+        print(f"The corners span x {px[:, 0].min():.0f}-{px[:, 0].max():.0f}, "
+              f"y {px[:, 1].min():.0f}-{px[:, 1].max():.0f} of the {CAMERA_WIDTH}x{CAMERA_HEIGHT} image "
+              "(see board_detect_debug.png).")
+        answer = input("Are all 4 yellow corners in frame and is this a good view of the board? "
+                       "[Y = save / r = search again / q = quit] ").strip().lower()
+        if answer == "q":
+            sys.exit("Not saved.")
+        if answer != "r":
             break
-        found = again
+
     cal.a1, cal.h1, cal.h8 = found["a1"], found["h1"], found["h8"]
     cal.q_view = arm.q
     cal.image_corners = found["image_corners"]
+    cal.save()  # from here on, only plain moves to saved positions; the camera isn't used
+    print(f"Saved the view pose and board position to {CALIBRATION_FILE}.")
     board = BoardFrame(cal)
-    px = found["outer_px"]
-    print(f"View set: the corners span x {px[:, 0].min():.0f}-{px[:, 0].max():.0f}, "
-          f"y {px[:, 1].min():.0f}-{px[:, 1].max():.0f} of the {CAMERA_WIDTH}x{CAMERA_HEIGHT} image.")
 
-    if check:  # hover just above a1, h1, h8
+    if check:  # hover just above the 4 corner squares
         arm.open(0.0)
-        for name in ("a1", "h1", "h8"):
-            p = getattr(cal, name)
+        corners = {"a1": cal.a1, "h1": cal.h1, "h8": cal.h8, "a8": cal.a1 + cal.h8 - cal.h1}
+        for name, p in corners.items():
             arm.move_to(p + board.ez * SAFE_HEIGHT)
             arm.move_to(p + board.ez * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
             print(f"  the fingertips should be just above the centre of {name}")
             time.sleep(1.0)
             arm.move_to(p + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
-        if input("Were the fingertips over the centres of a1, h1 and h8? [Y/n] ").strip().lower() == "n":
+        if input("Were the fingertips over the centres of a1, h1, h8 and a8? [Y/n] ").strip().lower() == "n":
             arm.move_joints(cal.q_view)
-            sys.exit("Not saved. If every point was off the same way, fix CAMERA_MOUNT_OFFSET / CAMERA_MOUNT_YAW_DEG; "
-                     "if they were off towards/away from the edges, fix BOARD_BORDER_FRACTION. Then run auto-calibrate again.")
+            sys.exit("The board position is saved but off. If every point was off the same way, fix CAMERA_MOUNT_OFFSET / "
+                     "CAMERA_MOUNT_YAW_DEG; if they were off towards/away from the edges, fix BOARD_BORDER_FRACTION. "
+                     "Then run auto-calibrate again.")
     print(f"Square size {board.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, board.ez[2]))):.1f} deg.")
     if last is not None:
         print(f"The board moved {np.linalg.norm(board.centre() - last) * 1000:.0f} mm since the last calibration.")
-    cal.save()
     arm.move_joints(cal.q_view)
 
 
