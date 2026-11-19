@@ -112,8 +112,9 @@ CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unava
 VIEW_FORWARD = (1.0, 0.0)  # "forward" in the robot base frame (x, y): from the robot towards the board
 VIEW_FORWARD_STEP = 0.04  # from home, the camera shifts forward this much at a time until all 4 corners are seen (m)
 VIEW_FORWARD_MAX = 0.40  # give up (and ask) after shifting this far forward (m)
-CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.06)  # ESTIMATE: camera optical centre in the gripper (EE) frame (m). MEASURE IT:
-#                                           an error here moves the whole board by the same amount.
+CAMERA_MOUNT_OFFSET = (0.05, 0.0, -0.05)  # measured (~): camera 5 cm forward of and 5 cm up from the fingertip point,
+#                                           in the gripper (EE) frame (x forward at home, z out of the fingertips, so up = -z).
+#                                           An error here moves the whole board by the same amount.
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
 CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
@@ -180,11 +181,16 @@ class Calibration:
         d = json.loads(Path(path).read_text())
         cal = cls(**{k: (np.array(v) if v is not None else None) for k, v in d.items() if k in cls.__dataclass_fields__})
         if cal.mount_fix is not None:
-            MOUNT_FIX[:] = cal.mount_fix
+            if d.get("mount_base") is not None and not np.allclose(d["mount_base"], CAMERA_MOUNT_OFFSET):
+                print("CAMERA_MOUNT_OFFSET changed since the hover corrections were learned; dropping them.")
+                cal.mount_fix = None
+            else:
+                MOUNT_FIX[:] = cal.mount_fix
         return cal
 
     def save(self, path=CALIBRATION_FILE):
         d = {k: (v.tolist() if v is not None else None) for k, v in self.__dict__.items()}
+        d["mount_base"] = list(CAMERA_MOUNT_OFFSET)  # the mount_fix is relative to this
         Path(path).write_text(json.dumps(d, indent=2))
         print(f"Saved {path}")
 
