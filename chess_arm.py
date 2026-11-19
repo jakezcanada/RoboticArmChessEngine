@@ -119,7 +119,7 @@ CAMERA_HEIGHT_FALLBACK = 0.50  # camera height above the board if depth is unava
 VIEW_FORWARD = (1.0, 0.0)  # "forward" in the robot base frame (x, y): from the robot towards the board
 VIEW_FORWARD_STEP = 0.04  # from home, the camera shifts forward this much at a time until all 4 corners are seen (m)
 VIEW_FORWARD_MAX = 0.40  # give up (and ask) after shifting this far forward (m)
-CAMERA_MOUNT_OFFSET = (-0.03, -0.01, -0.05)  # camera 3 cm back, 1 cm to the gripper's -y, 5 cm up from the fingertip point,
+CAMERA_MOUNT_OFFSET = (-0.05, -0.02, -0.05)  # camera 5 cm back, 2 cm to the gripper's -y, 5 cm up from the fingertip point,
 #                                           in the gripper (EE) frame (x forward at home, z out of the fingertips, so up = -z).
 #                                           An error here moves the whole board by the same amount.
 CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
