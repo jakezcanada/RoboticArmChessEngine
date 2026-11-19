@@ -92,7 +92,8 @@ SPEED_APPROACH = (0.02, 0.01, 0.05)  # going down to / up from a piece
 HOME_SPEED_FACTOR = 0.2  # move_home() speed; the miniPC allows at most 0.3
 CONFIRM_ROBOT_MOTION = True  # ask "type [yes]" once before the robot first moves
 JOINT_VEL_LIMIT = 0.6525  # rad/s: the miniPC refuses a trajectory faster than this ("JointVelocityAboveMaximumAllowed")
-JOINT_VEL_MARGIN = 0.7  # plan to at most this fraction of the limit
+JOINT_ACC_LIMIT = 7.5  # rad/s^2: the miniPC's joint acceleration limit
+JOINT_VEL_MARGIN = 0.7  # plan to at most this fraction of the velocity and acceleration limits
 JOINT_STEP_MAX = 0.05  # rad between two trajectory points; more means IK jumped (e.g. flipped the wrist)
 
 # --- Capture area (in squares, measured from the centre of a1 along the board axes)
@@ -257,20 +258,26 @@ def loc_name(loc) -> str:
 
 def slow_down(q_traj: np.ndarray, dt: float) -> np.ndarray:
     """Stretch a joint trajectory in time (same dt, more points) so no joint goes faster than
-    JOINT_VEL_MARGIN * JOINT_VEL_LIMIT. A Cartesian path can need fast joints near awkward poses."""
-    steps = np.abs(np.diff(q_traj, axis=0))
-    if len(steps) == 0:
+    JOINT_VEL_MARGIN * JOINT_VEL_LIMIT or accelerates harder than JOINT_VEL_MARGIN * JOINT_ACC_LIMIT.
+    A Cartesian path can need fast joints near awkward poses. Stretching k times divides
+    velocities by k and accelerations by k^2 (a smooth spline keeps it that way)."""
+    if len(q_traj) < 3:
         return q_traj
+    steps = np.abs(np.diff(q_traj, axis=0))
     if steps.max() > JOINT_STEP_MAX:
         raise RuntimeError(f"the joint path jumps {steps.max():.2f} rad in one step (IK flipped); not sending it")
-    k = steps.max() / dt / (JOINT_VEL_MARGIN * JOINT_VEL_LIMIT)
+    vel = steps.max() / dt
+    acc = np.abs(np.diff(q_traj, 2, axis=0)).max() / dt**2
+    k = max(vel / (JOINT_VEL_MARGIN * JOINT_VEL_LIMIT), math.sqrt(acc / (JOINT_VEL_MARGIN * JOINT_ACC_LIMIT)))
     if k <= 1.0:
         return q_traj
-    n = int(math.ceil(len(q_traj) * k))
+    from scipy.interpolate import CubicSpline
+
+    n = int(math.ceil((len(q_traj) - 1) * k)) + 1
     t_old = np.linspace(0.0, 1.0, len(q_traj))
     t_new = np.linspace(0.0, 1.0, n)
-    print(f"  slowing this move down {k:.1f}x to keep joints under {JOINT_VEL_MARGIN * JOINT_VEL_LIMIT:.2f} rad/s")
-    return np.column_stack([np.interp(t_new, t_old, q_traj[:, j]) for j in range(q_traj.shape[1])])
+    print(f"  slowing this move down {k:.1f}x (peak joint speed {vel:.2f} rad/s, acceleration {acc:.1f} rad/s^2)")
+    return CubicSpline(t_old, q_traj, axis=0)(t_new)
 
 
 class FrankyArm:
