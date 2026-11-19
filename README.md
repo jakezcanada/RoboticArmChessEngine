@@ -29,6 +29,8 @@ path, the roboticstoolbox Panda model turns it into joint angles, and the miniPC
 The program asks you to type `yes` once before the robot first moves
 (`CONFIRM_ROBOT_MOTION`). Speeds are `SPEED_TRAVEL` / `SPEED_APPROACH` (Ruckig fractions)
 and `HOME_SPEED_FACTOR` (at most 0.3).
+Any move that would need a joint faster than 0.6525 rad/s or 7.5 rad/s² is slowed to just
+under those limits (`JOINT_VEL_MARGIN` = 0.95), nothing more.
 
 ## Setup (once per station)
 
@@ -47,7 +49,10 @@ next to the script.
 board's own colours are not, because they look too much like the table. The inside corner
 of each L is a corner of the board. From home, the bottom-left and bottom-right corners
 must be in view; the camera shifts forward (`VIEW_FORWARD_STEP`) until all 4 are in the
-image, climbing if the near ones drop out before the far ones appear. Depth gives the board's height and tilt, and which side the robot
+image, climbing if the near ones drop out before the far ones appear. Only colour is used:
+the board's known 34 cm size and where its 4 corners appear in the image give its distance
+and tilt (no depth camera). The squares inside must show a checkerboard with a1 dark
+(ranks 3-6 are checked, so calibrate before moving pieces there), and which side the robot
 sits on (`--robot-color`) decides which corner is a1. The playing area starts
 `BOARD_BORDER` (1 cm) in from the corners; squares are 4 cm (`SQUARE_SIZE`), so the board is 34 cm.
 

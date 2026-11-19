@@ -85,15 +85,15 @@ OPEN_CLEARANCE = 0.020  # open this much wider than the piece base before descen
 # --- Motion ----------------------------------------------------------------
 SAFE_HEIGHT = 0.12  # travel height above the board (clears the king)
 PLACE_EXTRA_HEIGHT = 0.003  # release this much higher than the grasp height
-# Speeds are Ruckig (velocity, acceleration, jerk) fractions of the Panda's limits, as in the
-# csc376_franky examples (they use 0.02, 0.01, 0.05). Start slow; raise only after testing.
-SPEED_TRAVEL = (0.05, 0.03, 0.08)  # moves at safe height
-SPEED_APPROACH = (0.02, 0.01, 0.05)  # going down to / up from a piece
+# Speeds are Ruckig (velocity, acceleration, jerk) fractions of the Panda's Cartesian limits.
+# Any move that would then need a joint faster than the miniPC allows is slowed to just under it.
+SPEED_TRAVEL = (0.3, 0.3, 0.5)  # moves at safe height
+SPEED_APPROACH = (0.1, 0.1, 0.3)  # going down to / up from a piece
 HOME_SPEED_FACTOR = 0.2  # move_home() speed; the miniPC allows at most 0.3
 CONFIRM_ROBOT_MOTION = True  # ask "type [yes]" once before the robot first moves
 JOINT_VEL_LIMIT = 0.6525  # rad/s: the miniPC refuses a trajectory faster than this ("JointVelocityAboveMaximumAllowed")
 JOINT_ACC_LIMIT = 7.5  # rad/s^2: the miniPC's joint acceleration limit
-JOINT_VEL_MARGIN = 0.7  # plan to at most this fraction of the velocity and acceleration limits
+JOINT_VEL_MARGIN = 0.95  # a move over the limits is slowed to this fraction of them (just under)
 JOINT_STEP_MAX = 0.05  # rad between two trajectory points; more means IK jumped (e.g. flipped the wrist)
 
 # --- Capture area (in squares, measured from the centre of a1 along the board axes)
@@ -967,47 +967,10 @@ def camera_pose(arm_pose: np.ndarray) -> np.ndarray:
     return arm_pose @ T
 
 
-def depth_at(depth, u, v, r=3) -> float:
-    win = depth[max(int(v) - r, 0) : int(v) + r + 1, max(int(u) - r, 0) : int(u) + r + 1]
-    win = win[win > 0]
-    return float(np.median(win)) if win.size else float("nan")
-
-
 def pixel_rays(px, intrinsics) -> np.ndarray:
     fx, fy, cx, cy = intrinsics
     px = np.asarray(px, float)
     return np.column_stack([(px[:, 0] - cx) / fx, (px[:, 1] - cy) / fy, np.ones(len(px))])
-
-
-def fit_plane(depth, mask, intrinsics, samples=3000):
-    """Plane (point, normal) in the camera frame through the depth readings under ``mask``.
-    Points well off the plane (dark pieces, noise) are dropped."""
-    v, u = np.nonzero(mask & (depth > 0))
-    if len(u) < 100:
-        return None
-    rng = np.random.default_rng(0)
-    pick = rng.choice(len(u), min(samples, len(u)), replace=False)
-    pts = pixel_rays(np.column_stack([u[pick], v[pick]]), intrinsics) * depth[v[pick], u[pick], None]
-    # RANSAC first: pieces can cover a third of the board, which drags a plain least-squares fit
-    keep, best = None, 0
-    for _ in range(200):
-        a, b, c = pts[rng.choice(len(pts), 3, replace=False)]
-        n = np.cross(b - a, c - a)
-        if np.linalg.norm(n) < 1e-9:
-            continue
-        n /= np.linalg.norm(n)
-        inl = np.abs((pts - a) @ n) < 0.004
-        if inl.sum() > best:
-            keep, best = inl, inl.sum()
-    if keep is None or best < 50:
-        return None
-    for _ in range(3):
-        c = pts[keep].mean(0)
-        n = np.linalg.svd(pts[keep] - c)[2][2]
-        keep = np.abs((pts - c) @ n) < 0.005
-        if keep.sum() < 50:
-            return None
-    return c, n
 
 
 def on_plane(px, plane, intrinsics) -> np.ndarray:
@@ -1062,6 +1025,56 @@ def bracket_corners(mask) -> list[np.ndarray]:
     return out
 
 
+CHECKER_MIN_CONTRAST = 15  # light squares must be at least this much brighter (grey levels, 0-255) than dark ones
+
+
+def board_plane_from_corners(quad, intrinsics, cam_T):
+    """Board plane (point, normal; camera frame) from the 4 corner pixels and the known board size.
+    Colour only: a square of known size seen in the image fixes its distance and tilt.
+    Returns (plane, error) where error is how far the corners are from a perfect square (fraction of its size)."""
+    import cv2
+
+    fx, fy, cx, cy = intrinsics
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], float)
+    hs = BOARD_WIDTH / 2
+    obj = np.array([[-hs, hs, 0], [hs, hs, 0], [hs, -hs, 0], [-hs, -hs, 0]], np.float32)  # IPPE_SQUARE order
+    size_px = np.linalg.norm(quad[2] - quad[0])
+    best = None
+    for img in (quad, quad[::-1]):  # either winding; the wrong one gives a board seen from below
+        ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, np.float32(img), K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        for rv, tv in zip(rvecs, tvecs) if ok else ():
+            R = cv2.Rodrigues(rv)[0]
+            t = tv.reshape(3)
+            if t[2] <= 0:
+                continue
+            proj = cv2.projectPoints(obj, rv, tv, K, None)[0].reshape(-1, 2)
+            err = np.linalg.norm(proj - img, axis=1).max() / size_px
+            n_c = R[:, 2] if R[:, 2] @ t < 0 else -R[:, 2]  # board normal pointing back at the camera
+            level = abs((cam_T[:3, :3] @ n_c)[2])  # 1 = board flat; picks between the two tilts IPPE allows
+            key = (err > 0.03, -level, err)
+            if best is None or key < best[0]:
+                best = (key, (t, n_c), err)
+    return (None, 1.0) if best is None else (best[1], best[2])
+
+
+def checker_contrast(color, inner_px) -> float:
+    """How much brighter the light squares are than the dark ones (a1 dark), from ranks 3-6
+    (empty at the start). Negative = the pattern is the other way round (labels turned 90 deg)."""
+    import cv2
+
+    P = 24
+    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+    M = cv2.getPerspectiveTransform(np.float32(inner_px), np.float32([[0, 8 * P], [8 * P, 8 * P], [8 * P, 0], [0, 0]]))
+    top = cv2.warpPerspective(gray, M, (8 * P, 8 * P))
+    light, dark = [], []
+    for rank in range(2, 6):
+        for file in range(8):
+            y, x = (7 - rank) * P, file * P
+            patch = top[y + P // 4 : y + P - P // 4, x + P // 4 : x + P - P // 4]
+            (light if (file + rank) % 2 else dark).append(float(patch.mean()))
+    return float(np.median(light) - np.median(dark))
+
+
 def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool = False):
     """Find the board from where the arm is now, using only the 4 yellow corners.
 
@@ -1071,7 +1084,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     corners) or None."""
     import cv2
 
-    color, depth, _ = cam.read()
+    color = cam.read()[0]  # colour only; depth isn't used to find the board
     mask = corner_mask(color)
     pts = bracket_corners(mask)
     locate_board.seen, locate_board.pts = len(pts), [np.asarray(q, float) for q in pts]
@@ -1096,20 +1109,13 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
         return None
     c = pts.mean(0)
     quad = pts[np.argsort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))]  # in order around the board
-    inside = np.zeros(mask.shape, np.uint8)
-    cv2.fillConvexPoly(inside, quad.astype(np.int32), 1)
-    plane = fit_plane(depth, (inside > 0) & ~mask, cam.intrinsics)  # RANSAC: pieces don't matter
-    if plane is None:
-        print("  corners found, but not enough depth readings on the board")
-        return None
     cam_T = camera_pose(arm.pose)
+    plane, err = board_plane_from_corners(quad, cam.intrinsics, cam_T)
+    if plane is None or err > 0.03:
+        print(f"  the 4 yellow corners don't form a square (off by {err:.0%})")
+        return None
     Q = on_plane(quad, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # board corners, base frame
     marks = on_plane(hull_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]  # marker outlines, base frame
-    sides = [np.linalg.norm(Q[(i + 1) % 4] - Q[i]) for i in range(4)]
-    diags = [np.linalg.norm(Q[2] - Q[0]), np.linalg.norm(Q[3] - Q[1])]
-    if max(sides) / min(sides) > 1.15 or max(diags) / min(diags) > 1.1:
-        print(f"  the 4 yellow corners don't form a square (sides {np.round(np.array(sides) * 1000)} mm)")
-        return None
     centre = Q.mean(0)
     n = np.cross(Q[1] - Q[0], Q[2] - Q[1])
     n /= np.linalg.norm(n)
@@ -1122,17 +1128,26 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     ey = max((e if e @ want >= 0 else -e for e in edges), key=lambda e: e @ want / np.linalg.norm(e))
     ey = ey - n * (n @ ey)
     ey /= np.linalg.norm(ey)
-    ex = np.cross(ey, n)
     rel = Q - centre
-    order = [np.argmin(rel @ (ex + ey)), np.argmax(rel @ (ex - ey)), np.argmax(rel @ (ex + ey)), np.argmax(rel @ (ey - ex))]
-    if len(set(order)) < 4:
-        print("  couldn't tell which corner is which")
+    b = BOARD_BORDER_FRACTION  # playing area: this far in from the board's edges
+    for attempt in range(2):
+        ex = np.cross(ey, n)
+        order = [np.argmin(rel @ (ex + ey)), np.argmax(rel @ (ex - ey)), np.argmax(rel @ (ex + ey)), np.argmax(rel @ (ey - ex))]
+        if len(set(order)) < 4:
+            print("  couldn't tell which corner is which")
+            return None
+        outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
+        H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
+        inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
+        contrast = checker_contrast(color, inner_px)  # colour check: is a1 dark and the pattern a checkerboard?
+        if contrast >= CHECKER_MIN_CONTRAST:
+            break
+        if contrast <= -CHECKER_MIN_CONTRAST and attempt == 0:
+            print("  the checkerboard shows a1 would be a light square; turning the labels 90 deg")
+            ey = ex if ex @ want >= 0 else -ex  # the other edge direction, still as close to `want` as possible
+            continue
+        print(f"  the squares inside the yellow corners don't look like a checkerboard (contrast {contrast:.0f})")
         return None
-    outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
-    # playing area: BOARD_BORDER_FRACTION in from the board's edges
-    b = BOARD_BORDER_FRACTION
-    H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
-    inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
     C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]
     sq = np.mean([np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]) / 8
     a1 = C[0] + sq / 2 * (ex + ey)
@@ -1140,10 +1155,7 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     for name, pt in zip(("a1", "h1", "h8", "a8"), inner_px):
         cv2.putText(debug, name, tuple(int(x) for x in pt), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.imwrite(str(debug_path), debug)
-    print(f"  4 corners found: square {sq * 1000:.1f} mm, board centre {np.round(centre, 3)}")
-    if abs(np.mean(sides) - BOARD_WIDTH) > 0.05 * BOARD_WIDTH:
-        print(f"  WARNING: board measured {np.mean(sides) * 1000:.0f} mm wide, expected {BOARD_WIDTH * 1000:.0f} mm "
-              "(check the camera depth / CAMERA_MOUNT_OFFSET)")
+    print(f"  4 corners found: board centre {np.round(centre, 3)}, checker contrast {contrast:.0f}")
     return {"a1": a1, "h1": a1 + 7 * sq * ex, "h8": a1 + 7 * sq * (ex + ey), "axes": (ex, ey, n, sq),
             "outer": outer, "outer_px": outer_px, "image_corners": inner_px.astype(float),
             "marks": marks, "marks_px": hull_px}
