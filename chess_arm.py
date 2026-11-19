@@ -1025,6 +1025,8 @@ def bracket_corners(mask) -> list[np.ndarray]:
     return out
 
 
+# Which corner of the camera image is which square (the view after the camera squares itself to the board)
+CORNER_LABELS = {"bottom_left": "h8", "bottom_right": "a8", "top_left": "h1", "top_right": "a1"}
 CHECKER_MIN_CONTRAST = 15  # light squares must be at least this much brighter (grey levels, 0-255) than dark ones
 
 
@@ -1121,33 +1123,28 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     n /= np.linalg.norm(n)
     if n[2] < 0:
         n = -n
-    # ranks run towards the robot when it plays black (it sits behind rank 8)
-    towards_robot = np.array([-centre[0], -centre[1], 0.0])
-    want = -towards_robot if robot_white else towards_robot
-    edges = [Q[(i + 1) % 4] - Q[i] for i in range(4)]
-    ey = max((e if e @ want >= 0 else -e for e in edges), key=lambda e: e @ want / np.linalg.norm(e))
+    # Label the corners by where they are in the camera image (CORNER_LABELS)
+    by_v = np.argsort(quad[:, 1])
+    top, bottom = sorted(by_v[:2], key=lambda i: quad[i, 0]), sorted(by_v[2:], key=lambda i: quad[i, 0])
+    where = {"top_left": top[0], "top_right": top[1], "bottom_left": bottom[0], "bottom_right": bottom[1]}
+    idx = {name: where[pos] for pos, name in CORNER_LABELS.items()}
+    order = [idx["a1"], idx["h1"], idx["h8"], idx["a8"]]
+    ey = Q[idx["a8"]] - Q[idx["a1"]]  # rank 1 -> rank 8
     ey = ey - n * (n @ ey)
     ey /= np.linalg.norm(ey)
-    rel = Q - centre
+    ex = np.cross(ey, n)  # a-file -> h-file
+    if ex @ (Q[idx["h1"]] - Q[idx["a1"]]) < 0:
+        print("  WARNING: CORNER_LABELS give a mirrored board (a1 -> h1 and a1 -> a8 the wrong way round)")
+    outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
     b = BOARD_BORDER_FRACTION  # playing area: this far in from the board's edges
-    for attempt in range(2):
-        ex = np.cross(ey, n)
-        order = [np.argmin(rel @ (ex + ey)), np.argmax(rel @ (ex - ey)), np.argmax(rel @ (ex + ey)), np.argmax(rel @ (ey - ex))]
-        if len(set(order)) < 4:
-            print("  couldn't tell which corner is which")
-            return None
-        outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
-        H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
-        inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
-        contrast = checker_contrast(color, inner_px)  # colour check: is a1 dark and the pattern a checkerboard?
-        if contrast >= CHECKER_MIN_CONTRAST:
-            break
-        if contrast <= -CHECKER_MIN_CONTRAST and attempt == 0:
-            print("  the checkerboard shows a1 would be a light square; turning the labels 90 deg")
-            ey = ex if ex @ want >= 0 else -ex  # the other edge direction, still as close to `want` as possible
-            continue
+    H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
+    inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
+    contrast = checker_contrast(color, inner_px)  # colour check: the squares inside form a checkerboard
+    if abs(contrast) < CHECKER_MIN_CONTRAST:
         print(f"  the squares inside the yellow corners don't look like a checkerboard (contrast {contrast:.0f})")
         return None
+    if contrast < 0:
+        print("  NOTE: with CORNER_LABELS, a1 is a light square (on a standard board it's dark)")
     C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]
     sq = np.mean([np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]) / 8
     a1 = C[0] + sq / 2 * (ex + ey)
