@@ -171,13 +171,17 @@ class Calibration:
     R_down: np.ndarray | None = None  # gripper orientation pointing down (from move_to_start)
     q_view: np.ndarray | None = None  # joint angles of the camera viewing pose
     image_corners: np.ndarray | None = None  # pixel corners of the playing area: a1, h1, h8, a8
+    mount_fix: np.ndarray | None = None  # correction to CAMERA_MOUNT_OFFSET (gripper frame, m), learned from hover misses
 
     @classmethod
     def load(cls, path=CALIBRATION_FILE) -> "Calibration":
         if not Path(path).exists():
             return cls()
         d = json.loads(Path(path).read_text())
-        return cls(**{k: (np.array(v) if v is not None else None) for k, v in d.items()})
+        cal = cls(**{k: (np.array(v) if v is not None else None) for k, v in d.items() if k in cls.__dataclass_fields__})
+        if cal.mount_fix is not None:
+            MOUNT_FIX[:] = cal.mount_fix
+        return cal
 
     def save(self, path=CALIBRATION_FILE):
         d = {k: (v.tolist() if v is not None else None) for k, v in self.__dict__.items()}
@@ -914,11 +918,18 @@ class Stockfish:
 # =============================================================================
 
 
+MOUNT_FIX = np.zeros(3)  # learned correction to CAMERA_MOUNT_OFFSET (set from the calibration file)
+
+
+def mount_offset() -> np.ndarray:
+    return np.asarray(CAMERA_MOUNT_OFFSET, float) + MOUNT_FIX
+
+
 def camera_pose(arm_pose: np.ndarray) -> np.ndarray:
     """Camera pose in the robot base frame, from the gripper pose and the camera mount."""
     T = np.eye(4)
     T[:3, :3] = rot_z(math.radians(CAMERA_MOUNT_YAW_DEG))
-    T[:3, 3] = CAMERA_MOUNT_OFFSET
+    T[:3, 3] = mount_offset()
     return arm_pose @ T
 
 
@@ -1114,7 +1125,7 @@ def view_pose_for(found, intrinsics, R_down):
     h = float(max(fx * half_x / room_x, fy * half_y / room_y))  # no fixed height: whatever makes the board fill the image
     cam_pos = centre + n * h
     R_ee = rot_z(yaw) @ R_down
-    return cam_pos - R_ee @ np.asarray(CAMERA_MOUNT_OFFSET), yaw, h
+    return cam_pos - R_ee @ mount_offset(), yaw, h
 
 
 def search_board(arm, cam: RealSenseCamera, robot_white: bool):
@@ -1209,20 +1220,47 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
     print(f"Saved the view pose and board position to {CALIBRATION_FILE}.")
     board = BoardFrame(cal)
 
-    if check:  # hover just above the 4 corner squares
+    R_view = arm.pose[:3, :3]  # gripper orientation the board was seen from
+
+    while check:  # hover just above the 4 corner squares; the user says how far off each one was
         arm.open(0.0)
         corners = {"a1": cal.a1, "h1": cal.h1, "h8": cal.h8, "a8": cal.a1 + cal.h8 - cal.h1}
-        for name, p in corners.items():
-            arm.move_to(p + board.ez * SAFE_HEIGHT)
-            arm.move_to(p + board.ez * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
-            print(f"  the fingertips should be just above the centre of {name}")
-            time.sleep(1.0)
-            arm.move_to(p + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
-        if input("Were the fingertips over the centres of a1, h1, h8 and a8? [Y/n] ").strip().lower() == "n":
-            arm.move_joints(cal.q_view)
-            sys.exit("The board position is saved but off. If every point was off the same way, fix CAMERA_MOUNT_OFFSET / "
-                     "CAMERA_MOUNT_YAW_DEG; if they were off towards/away from the edges, fix BOARD_BORDER_FRACTION. "
-                     "Then run auto-calibrate again.")
+        misses = []
+        print("At each corner square, say how far the fingertips are from the square's centre, in cm:\n"
+              "  'forward left'  forward = away from the robot base, left = the robot's left (negative = back / right)\n"
+              "  e.g. '5 -2' = 5 cm too far forward and 2 cm too far right. Just Enter = on target.")
+        for name, sq in corners.items():
+            arm.move_to(sq + board.ez * SAFE_HEIGHT)
+            arm.move_to(sq + board.ez * AUTO_CAL_HOVER, speed=SPEED_APPROACH)
+            while True:
+                txt = input(f"  {name}: miss (forward left, cm) = ").strip().replace(",", " ")
+                try:
+                    vals = [float(v) for v in txt.split()] if txt else [0.0, 0.0]
+                    if len(vals) == 2:
+                        break
+                except ValueError:
+                    pass
+                print("  type two numbers, e.g. '5 -2', or just Enter")
+            misses.append(np.array([vals[0], vals[1], 0.0]) / 100)
+            arm.move_to(sq + board.ez * SAFE_HEIGHT, speed=SPEED_APPROACH)
+        misses = np.array(misses)
+        m = misses.mean(0)
+        if np.linalg.norm(m) < 0.003 and np.abs(misses).max() < 0.006:
+            print("All 4 corners on target.")
+            break
+        spread = np.linalg.norm(misses - m, axis=1).max()
+        if spread > 0.01:
+            print(f"  NOTE: the misses differ by up to {spread * 100:.1f} cm between corners, so it isn't only a shift: "
+                  "check CAMERA_MOUNT_YAW_DEG (turn) or the board width warning (scale). Correcting the average shift now.")
+        # the computed points were off by m: shift the board, and fix the camera mount so the next search is right.
+        # point = gripper + R_view @ (mount offset) + ...; an offset error d moves every point by R_view @ d
+        cal.a1, cal.h1, cal.h8 = cal.a1 - m, cal.h1 - m, cal.h8 - m
+        MOUNT_FIX[:] = MOUNT_FIX - R_view.T @ m
+        cal.mount_fix = MOUNT_FIX.copy()
+        cal.save()
+        board = BoardFrame(cal)
+        print(f"Shifted the board {m[0] * 100:.1f} cm back, {m[1] * 100:.1f} cm right; camera mount now "
+              f"{np.round(mount_offset(), 3)} m (CAMERA_MOUNT_OFFSET + learned fix). Checking again.")
     print(f"Square size {board.square * 1000:.1f} mm. Board tilt {math.degrees(math.acos(min(1, board.ez[2]))):.1f} deg.")
     if last is not None:
         print(f"The board moved {np.linalg.norm(board.centre() - last) * 1000:.0f} mm since the last calibration.")
