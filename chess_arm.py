@@ -134,8 +134,11 @@ VIEW_MARGIN = 0.02  # the yellow markers' outer edges end up this fraction of th
 VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
 #                          climb this much and keep shifting forward
 VIEW_FIT_TOLERANCE = 0.005  # stop adjusting the view when the next move would be shorter than this (m)
+VIEW_CENTRE_STEPS = 6  # at most this many sideways corrections in a row while centring over the board
+VIEW_CLIMB_STEP = 0.02  # after the vertical move, climb this much at a time if a marker is cut off (m)
+VIEW_MAX_CLIMBS = 5
 #  If the corners aren't found, look at board_detect_debug.png (cyan = what was taken as yellow).
-AUTO_CAL_HOVER = 0.10  # check height: the fingertips stop this far above the board over the corner squares
+AUTO_CAL_HOVER = 0.05  # check height: the fingertips stop this far above the board over the corner squares
 
 # --- COLOR detection: these are the variables to tune (HSV, OpenCV ranges H 0-180, S/V 0-255)
 #     Use `python chess_arm.py view` to see the result live.
@@ -1067,8 +1070,6 @@ def bracket_corners(mask) -> list[np.ndarray]:
     return out
 
 
-# Which corner of the camera image is which square (the view after the camera squares itself to the board)
-CORNER_LABELS = {"bottom_left": "h8", "bottom_right": "a8", "top_left": "h1", "top_right": "a1"}
 CHECKER_MIN_CONTRAST = 15  # light squares must be at least this much brighter (grey levels, 0-255) than dark ones
 
 
@@ -1101,22 +1102,74 @@ def board_plane_from_corners(quad, intrinsics, cam_T):
     return (None, 1.0) if best is None else (best[1], best[2])
 
 
-def checker_contrast(color, inner_px) -> float:
-    """How much brighter the light squares are than the dark ones (a1 dark), from ranks 3-6
-    (empty at the start). Negative = the pattern is the other way round (labels turned 90 deg)."""
+def label_corners(color, quad, Q):
+    """Which of the 4 board corners is a1, h1, h8, a8, from colour and where the robot is.
+
+    Colour: the middle 16 squares (c3-f6, empty in the starting position whichever way the board
+    is turned) show which diagonal of corners is dark: a1 and h8 are dark, h1 and a8 light. The
+    corner squares themselves are measured too (at their corner nearest the board centre, which a
+    piece standing on them hides least) as a cross-check.
+    Robot side: the robot plays black, so of the two labellings that fit the colours, rank 8
+    (a8-h8) is the edge nearer the robot (back along VIEW_FORWARD); a8 ends up on the robot's right.
+
+    Returns (indices into quad for a1, h1, h8, a8; checker contrast; playing-area corner pixels
+    in that order) or None."""
     import cv2
 
+    c = Q.mean(0)
+    ccw = list(np.argsort(np.arctan2(Q[:, 1] - c[1], Q[:, 0] - c[0])))  # anticlockwise seen from above, like a1 h1 h8 a8
     P = 24
+    b = BOARD_BORDER_FRACTION
     gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
-    M = cv2.getPerspectiveTransform(np.float32(inner_px), np.float32([[0, 8 * P], [8 * P, 8 * P], [8 * P, 0], [0, 0]]))
-    top = cv2.warpPerspective(gray, M, (8 * P, 8 * P))
+
+    def view_from(k):
+        """Top-down image (a1 bottom-left) taking corner ccw[k] as a1, and its playing-area corners."""
+        px = quad[[ccw[(k + i) % 4] for i in range(4)]]
+        H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(px))
+        inner = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
+        M = cv2.getPerspectiveTransform(np.float32(inner), np.float32([[0, 8 * P], [8 * P, 8 * P], [8 * P, 0], [0, 0]]))
+        return cv2.warpPerspective(gray, M, (8 * P, 8 * P)), inner
+
+    top, _ = view_from(0)
     light, dark = [], []
     for rank in range(2, 6):
-        for file in range(8):
+        for file in range(2, 6):
             y, x = (7 - rank) * P, file * P
             patch = top[y + P // 4 : y + P - P // 4, x + P // 4 : x + P - P // 4]
             (light if (file + rank) % 2 else dark).append(float(patch.mean()))
-    return float(np.median(light) - np.median(dark))
+    contrast = float(np.median(light) - np.median(dark))  # > 0: corners ccw[0] and ccw[2] are dark
+    if abs(contrast) < CHECKER_MIN_CONTRAST:
+        print(f"  the squares inside the yellow corners don't look like a checkerboard (contrast {contrast:.0f})")
+        return None
+    # Each corner square is sampled at its own corner nearest the board centre: a piece standing on
+    # it leans outwards in the image (away from the camera), so that part is the least covered.
+    q, m = P // 4, 2
+    lo, hi = slice(P - m - q, P - m), slice(7 * P + m, 7 * P + m + q)
+    corner = [float(top[hi, lo].mean()), float(top[hi, hi].mean()), float(top[lo, hi].mean()), float(top[lo, lo].mean())]  # ccw[0..3]
+    corner_contrast = (corner[1] + corner[3] - corner[0] - corner[2]) / 2
+    if corner_contrast * contrast < 0 and abs(corner_contrast) > CHECKER_MIN_CONTRAST:
+        print(f"  WARNING: the corner squares ({corner_contrast:+.0f}) disagree with the middle squares "
+              f"({contrast:+.0f}) about which corners are dark (pieces in the way?); going by the middle squares")
+    dark0 = 0 if contrast > 0 else 1
+    fwd = np.array([*VIEW_FORWARD, 0.0], float)
+    fwd /= np.linalg.norm(fwd)
+    reach = Q @ fwd  # how far forward of the robot each corner is
+
+    def rank8_reach(k):  # a8 and h8 are ccw[k+3], ccw[k+2] when ccw[k] is a1
+        return reach[ccw[(k + 2) % 4]] + reach[ccw[(k + 3) % 4]]
+
+    k = min((dark0, dark0 + 2), key=rank8_reach)
+    order = [ccw[(k + i) % 4] for i in range(4)]
+    near = set(np.argsort(reach)[:2])
+    if near != {order[2], order[3]}:
+        print("  the board is turned 90 deg: with a1/h8 dark, rank 8 isn't on the robot's side. "
+              "Turn the board so the a8-h8 edge faces the robot (a8 = light square on the robot's right).")
+        return None
+    _, inner = view_from(k)
+    names = ("a1", "h1", "h8", "a8")
+    sensed = ", ".join(f"{names[i]} {'light' if (i % 2) else 'dark'} ({corner[(k + i) % 4]:.0f})" for i in range(4))
+    print(f"  corner squares (grey level): {sensed}; middle-square contrast {abs(contrast):.0f}")
+    return order, abs(contrast), inner
 
 
 def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool = False):
@@ -1169,28 +1222,20 @@ def locate_board(arm, cam: RealSenseCamera, robot_white: bool, full_marks: bool 
     n /= np.linalg.norm(n)
     if n[2] < 0:
         n = -n
-    # Label the corners by where they are in the camera image (CORNER_LABELS)
-    by_v = np.argsort(quad[:, 1])
-    top, bottom = sorted(by_v[:2], key=lambda i: quad[i, 0]), sorted(by_v[2:], key=lambda i: quad[i, 0])
-    where = {"top_left": top[0], "top_right": top[1], "bottom_left": bottom[0], "bottom_right": bottom[1]}
-    idx = {name: where[pos] for pos, name in CORNER_LABELS.items()}
-    order = [idx["a1"], idx["h1"], idx["h8"], idx["a8"]]
+    # Name the corners: colour picks the dark diagonal (a1, h8), and the robot plays black, so rank 8
+    # is the edge nearer the robot.
+    labels = label_corners(color, quad, Q)
+    if labels is None:
+        return None
+    order, contrast, inner_px = labels
+    idx = dict(zip(("a1", "h1", "h8", "a8"), order))
     ey = Q[idx["a8"]] - Q[idx["a1"]]  # rank 1 -> rank 8
     ey = ey - n * (n @ ey)
     ey /= np.linalg.norm(ey)
     ex = np.cross(ey, n)  # a-file -> h-file
     if ex @ (Q[idx["h1"]] - Q[idx["a1"]]) < 0:
-        print("  WARNING: CORNER_LABELS give a mirrored board (a1 -> h1 and a1 -> a8 the wrong way round)")
+        print("  WARNING: the corner labels give a mirrored board (a1 -> h1 and a1 -> a8 the wrong way round)")
     outer_px, outer = quad[order], Q[order]  # a1, h1, h8, a8 corners of the board
-    b = BOARD_BORDER_FRACTION  # playing area: this far in from the board's edges
-    H = cv2.getPerspectiveTransform(np.float32([[0, 1], [1, 1], [1, 0], [0, 0]]), np.float32(outer_px))
-    inner_px = cv2.perspectiveTransform(np.float32([[[b, 1 - b], [1 - b, 1 - b], [1 - b, b], [b, b]]]), H)[0]
-    contrast = checker_contrast(color, inner_px)  # colour check: the squares inside form a checkerboard
-    if abs(contrast) < CHECKER_MIN_CONTRAST:
-        print(f"  the squares inside the yellow corners don't look like a checkerboard (contrast {contrast:.0f})")
-        return None
-    if contrast < 0:
-        print("  NOTE: with CORNER_LABELS, a1 is a light square (on a standard board it's dark)")
     C = on_plane(inner_px, plane, cam.intrinsics) @ cam_T[:3, :3].T + cam_T[:3, 3]
     sq = np.mean([np.linalg.norm(C[(i + 1) % 4] - C[i]) for i in range(4)]) / 8
     a1 = C[0] + sq / 2 * (ex + ey)
@@ -1296,20 +1341,110 @@ def search_board(arm, cam: RealSenseCamera, robot_white: bool):
     return None
 
 
-def settle_and_locate(arm, cam, robot_white, tries=3):
+def settle_and_locate(arm, cam, robot_white, tries=3, full_marks=True):
     """locate_board, giving the camera a moment to settle (exposure, vibration) after a move."""
     for _ in range(tries):
         time.sleep(0.5)
-        if (found := locate_board(arm, cam, robot_white, full_marks=True)) is not None:
+        if (found := locate_board(arm, cam, robot_white, full_marks=full_marks)) is not None:
             return found
     return None
+
+
+def current_yaw(arm, R_down) -> float:
+    M = arm.pose[:3, :3] @ R_down.T  # = rot_z(current yaw)
+    return math.atan2(M[1, 0], M[0, 0])
+
+
+def warn_drift(before, after):
+    """The board didn't move, so seen from a new spot it should come out in the same place."""
+    drift = float(np.linalg.norm(after["outer"].mean(0)[:2] - before["outer"].mean(0)[:2]))
+    if drift > 0.02:
+        print(f"  WARNING: the board centre came out {drift * 100:.1f} cm from where the last view put it. "
+              "Check CAMERA_MOUNT_YAW_DEG (a wrong turn makes each move land sideways) and CAMERA_MOUNT_OFFSET.")
+
+
+def centre_horizontally(arm, cam, robot_white, found, R_down, full_marks):
+    """Slide the camera sideways (height unchanged) until it is straight above the board centre
+    and turned square to it. Each step re-finds the board and corrects again, so a step that
+    lands off target is fixed by the next. If a step loses the board, try half / a quarter of it."""
+    for _ in range(VIEW_CENTRE_STEPS):
+        target, yaw, _ = view_pose_for(found, cam.intrinsics, R_down)
+        p0, yaw0, q0 = arm.pose[:3, 3].copy(), current_yaw(arm, R_down), arm.q
+        goal = np.array([target[0], target[1], p0[2]])  # horizontal only
+        if np.linalg.norm(goal - p0) < VIEW_FIT_TOLERANCE and abs(yaw - yaw0) < math.radians(1):
+            return found
+        print(f"Centring over the board: sliding {np.linalg.norm(goal - p0) * 100:.1f} cm, "
+              f"turning {math.degrees(yaw - yaw0):.0f} deg (height unchanged).")
+        again = None
+        for frac in (1.0, 0.5, 0.25):
+            if frac < 1:
+                print(f"  lost the corners there; trying {frac:.0%} of the way")
+            try:
+                arm.move_to(p0 + frac * (goal - p0), yaw0 + frac * (yaw - yaw0))
+            except Exception as e:  # noqa: BLE001 - out of reach
+                print(f"  can't move there ({e})")
+                continue
+            if (again := settle_and_locate(arm, cam, robot_white, full_marks=full_marks)) is not None:
+                break
+        if again is None:
+            print("  going back to the last good view")
+            arm.move_joints(q0)
+            return found
+        warn_drift(found, again)
+        found = again
+    print("  WARNING: the camera still isn't centred after "
+          f"{VIEW_CENTRE_STEPS} corrections (check CAMERA_MOUNT_YAW_DEG / CAMERA_MOUNT_OFFSET)")
+    return found
+
+
+def move_vertically(arm, cam, robot_white, found, R_down):
+    """Go straight up or down (no sideways move) to the height where the 4 yellow markers fill
+    the image. If a marker is then cut off by the image edge, climb VIEW_CLIMB_STEP at a time.
+    Returns (found, moved) or (None, True) if the markers couldn't be wholly seen."""
+    target, _, h = view_pose_for(found, cam.intrinsics, R_down)
+    p0, yaw0 = arm.pose[:3, 3].copy(), current_yaw(arm, R_down)
+    goal = np.array([p0[0], p0[1], target[2]])  # vertical only
+    if abs(goal[2] - p0[2]) < VIEW_FIT_TOLERANCE:
+        return found, False
+    print(f"Moving straight {'down' if goal[2] < p0[2] else 'up'} {abs(goal[2] - p0[2]) * 100:.1f} cm: "
+          f"camera {h:.2f} m above the board.")
+    for climb in range(VIEW_MAX_CLIMBS + 1):
+        try:
+            arm.move_to(goal + [0, 0, climb * VIEW_CLIMB_STEP], yaw0)
+        except Exception as e:  # noqa: BLE001 - out of reach
+            print(f"  can't move there ({e})")
+            continue
+        if (again := settle_and_locate(arm, cam, robot_white)) is not None:
+            warn_drift(found, again)
+            return again, True
+        print(f"  a yellow marker is cut off (or lost); going {VIEW_CLIMB_STEP * 100:.0f} cm higher")
+    return None, True
+
+
+def fit_view(arm, cam, robot_white, found, R_down):
+    """Horizontal first, then vertical: centre over the board at the current height, then go
+    straight to the fitting height, then fine-tune horizontally there. Repeats until the
+    vertical step is no longer needed."""
+    for rnd in range(3):
+        found = centre_horizontally(arm, cam, robot_white, found, R_down, full_marks=rnd > 0)
+        q_ok = arm.q
+        down, moved = move_vertically(arm, cam, robot_white, found, R_down)
+        if down is None:
+            print("  couldn't see all 4 markers after the vertical move; going back to the last good view")
+            arm.move_joints(q_ok)
+            return found
+        found = down
+        if not moved:
+            break
+    return centre_horizontally(arm, cam, robot_white, found, R_down, full_marks=True)
 
 
 def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: bool = True):
     """Find the board with the camera and fill in a1, h1, h8, R_down, q_view and image_corners.
 
     1. From home, shift forward until all 4 yellow corners are in the image.
-    2. Zoom: move square above the board at the height where the corners reach the image edges.
+    2. Fit the view: first horizontally (centred and square to the board, re-checked until it
+       stops moving), then straight up/down to the height where the markers reach the image edges.
     3. The user confirms that view; it is saved.
     4. ``check``: hover over the 4 corner squares (no camera) and ask whether that looks right."""
     robot_white = args.robot_color == "white"
@@ -1326,44 +1461,7 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
                 sys.exit("Auto-calibration failed. Check the board position and CORNER_HSV (see board_detect_debug.png).")
             continue
 
-        # zoom: centred, square to the image, corners at the image edges
-        for _ in range(4):
-            target, yaw, h = view_pose_for(found, cam.intrinsics, cal.R_down)
-            if float(np.linalg.norm(target - arm.pose[:3, 3])) < VIEW_FIT_TOLERANCE:
-                break
-            print(f"Zooming to the board: camera {h:.2f} m above it, turned {math.degrees(yaw):.0f} deg.")
-            q_before = arm.q
-            T_before = arm.pose
-            p_before = T_before[:3, 3].copy()
-            M = T_before[:3, :3] @ cal.R_down.T  # = rot_z(current yaw)
-            yaw_before = math.atan2(M[1, 0], M[0, 0])
-            try:
-                arm.move_to(target, yaw)
-            except Exception as e:  # noqa: BLE001 - out of reach: keep the current view
-                print(f"  can't move there ({e}); keeping the current view")
-                break
-            again = settle_and_locate(arm, cam, robot_white)
-            # lost them (too far, or not a square any more): try partway between the last good view and the target
-            for frac in (0.5, 0.25):
-                if again is not None:
-                    break
-                print(f"  lost the corners there; trying {frac:.0%} of the way")
-                try:
-                    arm.move_to(p_before + frac * (target - p_before), yaw_before + frac * (yaw - yaw_before))
-                except Exception as e:  # noqa: BLE001
-                    print(f"  can't move there ({e})")
-                    continue
-                again = settle_and_locate(arm, cam, robot_white)
-            if again is None:
-                print("  going back to the last good view")
-                arm.move_joints(q_before)
-                break
-            # The board didn't move, so seen from the new spot it should come out in the same place.
-            drift = float(np.linalg.norm(again["outer"].mean(0)[:2] - found["outer"].mean(0)[:2]))
-            if drift > 0.02:
-                print(f"  WARNING: the board centre came out {drift * 100:.1f} cm from where the last view put it. "
-                      "Check CAMERA_MOUNT_YAW_DEG (a wrong turn makes each move land sideways) and CAMERA_MOUNT_OFFSET.")
-            found = again
+        found = fit_view(arm, cam, robot_white, found, cal.R_down)
 
         if (whole := settle_and_locate(arm, cam, robot_white, tries=1)) is not None:
             found = whole

@@ -57,16 +57,24 @@ must be in view; the camera shifts forward (`VIEW_FORWARD_STEP`) until all 4 are
 image, climbing if the near ones drop out before the far ones appear. Only colour is used:
 the board's known 34 cm size and where its 4 corners appear in the image give its distance
 and tilt (no depth camera). The squares inside must show a checkerboard pattern
-(ranks 3-6 are checked, so calibrate before moving pieces there). Corners are named by
-where they are in the camera image (`CORNER_LABELS`): bottom-left h8, bottom-right a8,
-top-left h1, top-right a1. The playing area starts
+(the middle 16 squares, c3-f6, are checked, so calibrate before moving pieces there).
+Corners are named from colour and the robot's side: the middle squares show which diagonal
+of corners is dark (a1 and h8 dark, h1 and a8 light; the corner squares are measured too as
+a cross-check), and since the robot plays black, rank 8 is the edge nearer the robot, with
+a8 on the robot's right. If the board is turned 90 deg (rank 8 not facing the robot) it
+says so and asks you to turn it. The playing area starts
 `BOARD_BORDER` (1 cm) in from the corners; squares are 4 cm (`SQUARE_SIZE`), so the board is 34 cm.
 
-**The camera then fits itself to the board:** it moves straight above the board's centre,
-turns square to it, and goes to whatever height puts the 4 corners at the edges of the
-image (`VIEW_MARGIN`, 2%, in from them); there is no fixed camera height. It checks again from there and repeats until the view stops
-changing. You confirm the view (or search again); then it is saved as the viewing pose, and
-the arm hovers 10 cm above a1, h1, h8 and a8 (`AUTO_CAL_HOVER`) using the saved positions only.
+**The camera then fits itself to the board, horizontal first, then vertical:**
+1. Horizontal: at its current height it slides (and turns) until it is straight above the
+   board's centre and square to it. After each slide it finds the board again and corrects,
+   so a slide that lands off target is fixed by the next (`VIEW_CENTRE_STEPS`); if a slide
+   loses the board it tries half, then a quarter, of it.
+2. Vertical: it goes straight up or down to the height that puts the 4 yellow markers at
+   the image edges (`VIEW_MARGIN`, 2%, in from them); there is no fixed camera height. If a
+   marker is then cut off it climbs `VIEW_CLIMB_STEP` at a time.
+3. It fine-tunes horizontally at that height, and repeats until the view stops changing. You confirm the view (or search again); then it is saved as the viewing pose, and
+the fingertips hover 5 cm above a1, h1, h8 and a8 (`AUTO_CAL_HOVER`; rooks are 3.5 cm) using the saved positions only.
 At each one you type how far off it is (`forward left [high]` in cm, Enter = on target); the
 average miss is taken off the board position and learned as a camera-mount correction
 (`mount_fix` in the calibration file, used by every later search), then it checks again.
