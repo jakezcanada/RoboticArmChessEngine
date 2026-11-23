@@ -122,9 +122,13 @@ VIEW_FORWARD_MAX = 0.40  # give up (and ask) after shifting this far forward (m)
 CAMERA_MOUNT_OFFSET = (-0.05, -0.02, -0.05)  # camera 5 cm back, 2 cm to the gripper's -y, 5 cm up from the fingertip point,
 #                                           in the gripper (EE) frame (x forward at home, z out of the fingertips, so up = -z).
 #                                           An error here moves the whole board by the same amount.
-CAMERA_MOUNT_YAW_DEG = 0.0  # ESTIMATE: rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis
-CORNER_HSV = ((18, 170, 140), (32, 255, 255))  # yellow brackets (HSV; measured H 24-27, S 230-255, V 220-255)
+CAMERA_MOUNT_YAW_DEG = 90.0  # rotation of the camera image x-axis from the gripper x-axis, about the gripper z-axis.
+#                             Measured from saved frames: moving the camera forward scrolls the board DOWN the image,
+#                             and with 0 here every zoom move landed 90 deg off (the board drifted out of view).
+CORNER_HSV = ((16, 120, 120), (32, 255, 255))  # yellow brackets (HSV; lit H 20-27 S 230-255, shadowed H 15-21 S 110-245 V 125-220)
 CORNER_MIN_AREA = 0.0002  # a yellow blob must cover this fraction of the image to count as a bracket
+CORNER_MAX_SOLIDITY = 0.8  # a whole L-bracket fills ~0.6 of its convex hull; light pieces / specks fill > 0.85
+CORNER_MIN_NOTCH = 0.25  # the L's notch must be this deep (x sqrt(blob area)); whole brackets ~0.75, edge slivers < 0.2
 BOARD_BORDER_FRACTION = BOARD_BORDER / BOARD_WIDTH  # 1 cm / 34 cm: the playing area starts this far in from the corners
 VIEW_MARGIN = 0.02  # the yellow markers' outer edges end up this fraction of the image width/height in from its edges
 VIEW_SEARCH_STEP = 0.07  # if the near corners leave the image before the far ones come in, the board doesn't fit:
@@ -191,6 +195,9 @@ class Calibration:
             if d.get("mount_base") is not None and not np.allclose(d["mount_base"], CAMERA_MOUNT_OFFSET):
                 print("CAMERA_MOUNT_OFFSET changed since the hover corrections were learned; dropping them.")
                 cal.mount_fix = None
+            elif not math.isclose(d.get("mount_yaw", 0.0), CAMERA_MOUNT_YAW_DEG):
+                print("CAMERA_MOUNT_YAW_DEG changed since the hover corrections were learned; dropping them.")
+                cal.mount_fix = None
             else:
                 MOUNT_FIX[:] = cal.mount_fix
         return cal
@@ -198,6 +205,7 @@ class Calibration:
     def save(self, path=CALIBRATION_FILE):
         d = {k: (v.tolist() if v is not None else None) for k, v in self.__dict__.items()}
         d["mount_base"] = list(CAMERA_MOUNT_OFFSET)  # the mount_fix is relative to this
+        d["mount_yaw"] = CAMERA_MOUNT_YAW_DEG  # ...and was learned with this camera turn
         Path(path).write_text(json.dumps(d, indent=2))
         print(f"Saved {path}")
 
@@ -1034,9 +1042,15 @@ def bracket_corners(mask) -> list[np.ndarray]:
     contours = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
     out = []
     bracket_corners.hulls = []  # outline (pixels) of each bracket, same order as the corners
+    h_img, w_img = mask.shape
     for c in sorted(contours, key=cv2.contourArea, reverse=True):
-        if cv2.contourArea(c) < CORNER_MIN_AREA * mask.size:
+        area = cv2.contourArea(c)
+        if area < CORNER_MIN_AREA * mask.size:
             break
+        x, y, w, h = cv2.boundingRect(c)
+        cut_off = x <= 1 or y <= 1 or x + w >= w_img - 1 or y + h >= h_img - 1
+        if not cut_off and area > CORNER_MAX_SOLIDITY * cv2.contourArea(cv2.convexHull(c)):
+            continue  # a solid blob (light piece, glare), not an L; brackets cut by the image edge are judged below
         hull = np.sort(cv2.convexHull(c, returnPoints=False), axis=0)
         try:
             defects = cv2.convexityDefects(c, hull)
@@ -1046,7 +1060,7 @@ def bracket_corners(mask) -> list[np.ndarray]:
             continue
         defects = defects.reshape(-1, 4)  # rows: start, end, farthest point, depth * 256
         start, end, far, depth = defects[np.argmax(defects[:, 3])]
-        if depth / 256 < 3:  # not an L (no real notch)
+        if depth / 256 < max(3, CORNER_MIN_NOTCH * math.sqrt(area)):  # not an L (no real notch; e.g. a sliver at the edge)
             continue
         out.append(c[far, 0].astype(float))
         bracket_corners.hulls.append(cv2.convexHull(c).reshape(-1, 2).astype(float))
@@ -1344,6 +1358,11 @@ def auto_calibrate(args, cal: Calibration, arm, cam: RealSenseCamera, check: boo
                 print("  going back to the last good view")
                 arm.move_joints(q_before)
                 break
+            # The board didn't move, so seen from the new spot it should come out in the same place.
+            drift = float(np.linalg.norm(again["outer"].mean(0)[:2] - found["outer"].mean(0)[:2]))
+            if drift > 0.02:
+                print(f"  WARNING: the board centre came out {drift * 100:.1f} cm from where the last view put it. "
+                      "Check CAMERA_MOUNT_YAW_DEG (a wrong turn makes each move land sideways) and CAMERA_MOUNT_OFFSET.")
             found = again
 
         if (whole := settle_and_locate(arm, cam, robot_white, tries=1)) is not None:

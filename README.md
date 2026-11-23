@@ -75,7 +75,7 @@ Colours (H 0-180, S/V 0-255), measured from a photo of the lab board and pieces:
 
 | | Setting | Measured |
 |---|---|---|
-| Yellow corners | `CORNER_HSV` | H 24-27, S 230-255, V 220-255 |
+| Yellow corners | `CORNER_HSV` | lit H 20-27, S 230-255; shadowed H 15-21, S 110-245, V 125-220 |
 | Light pieces | `WHITE_PIECE_HSV` | H 18-20, S 75-110, V 200-240 |
 | Dark pieces | `BLACK_PIECE_HSV` | H 0-11, S 110-230, V 25-120 |
 
@@ -86,7 +86,12 @@ means 170-180 and 0-12.
 
 Set before the first run:
 * `CAMERA_MOUNT_OFFSET`, `CAMERA_MOUNT_YAW_DEG`: where the camera sits on the gripper.
-  Any error here shifts the whole board by the same amount.
+  An offset error shifts the whole board by the same amount. A wrong yaw makes every move
+  land sideways (the board drifts out of view while zooming; a warning is printed when two
+  views disagree on where the board is). The camera is turned 90 deg: moving forward
+  scrolls the board down the image.
+* Yellow blobs only count as corners if they are L-shaped (`CORNER_MAX_SOLIDITY`,
+  `CORNER_MIN_NOTCH`), so light pieces and slivers at the image edge are ignored.
 * `VIEW_FORWARD`: which way is forward (robot towards board). From home, the bottom-left and
   bottom-right yellow corners must be in view; the camera shifts forward from there.
 
